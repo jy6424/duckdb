@@ -12,6 +12,11 @@
 #include "duckdb/execution/ht_entry.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+
 namespace duckdb {
 
 using ValidityBytes = TupleDataLayout::ValidityBytes;
@@ -358,6 +363,14 @@ GroupedAggregateHashTable::AggregateDictionaryState::AggregateDictionaryState()
 
 optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups, DataChunk &payload,
                                                                const unsafe_vector<idx_t> &filter) {
+	const char *gpu_groupby = std::getenv("GPU_GROUPBY");
+	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
+		static std::atomic<bool> printed_try_add_dictionary_groups(false);
+		if (!printed_try_add_dictionary_groups.exchange(true)) {
+			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups reached" << std::endl;
+		}
+	}
+
 	static constexpr idx_t MAX_DICTIONARY_SIZE_THRESHOLD = 20000;
 	static constexpr idx_t DICTIONARY_THRESHOLD = 2;
 	// dictionary vector - check if this is a duplicate eliminated dictionary from the storage
@@ -453,6 +466,14 @@ optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups
 	}
 
 	// finally process the aggregates
+	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
+		static std::atomic<bool> printed_before_update_aggregates(false);
+		if (!printed_before_update_aggregates.exchange(true)) {
+			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups -> UpdateAggregates"
+			          << std::endl;
+		}
+	}
+
 	UpdateAggregates(payload, filter);
 
 	return new_group_count;
@@ -531,6 +552,16 @@ idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, DataChunk &payload,
 }
 
 void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter) {
+	const char *gpu_groupby = std::getenv("GPU_GROUPBY");
+	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
+		static std::atomic<bool> printed_groupby_update(false);
+		if (!printed_groupby_update.exchange(true)) {
+			std::cerr << "[duckdb gpu groupby] UpdateAggregates reached: "
+			          << "payload_size=" << payload.size() << ", payload_cols=" << payload.ColumnCount()
+			          << ", aggregate_count=" << layout_ptr->GetAggregates().size() << std::endl;
+		}
+	}
+
 	// Now every cell has an entry, update the aggregates
 	auto &aggregates = layout_ptr->GetAggregates();
 	idx_t filter_idx = 0;

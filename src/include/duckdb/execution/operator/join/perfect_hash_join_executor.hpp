@@ -48,6 +48,9 @@ private:
 	template <typename T>
 	void TemplatedFillSelectionVectorProbe(Vector &source, SelectionVector &build_sel_vec,
 	                                       SelectionVector &probe_sel_vec, idx_t count, idx_t &prob_sel_count);
+	template <typename T>
+	bool TryGPUFillSelectionVectorProbe(Vector &source, SelectionVector &build_sel_vec, SelectionVector &probe_sel_vec,
+	                                    idx_t count, idx_t &probe_sel_count);
 
 	bool FillSelectionVectorSwitchBuild(Vector &source, SelectionVector &sel_vec, SelectionVector &seq_sel_vec,
 	                                    idx_t count);

@@ -3,7 +3,95 @@
 #include "duckdb/common/operator/subtract.hpp"
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <dlfcn.h>
+#include <iostream>
+#include <type_traits>
+
 namespace duckdb {
+
+namespace {
+
+using GpuProbeI64Func = int (*)(const int64_t *keys, const uint8_t *validity, uint64_t count, int64_t min_value,
+                                int64_t max_value, const uint8_t *build_bitmap, uint64_t build_size,
+                                uint32_t *probe_sel_out, uint32_t *build_sel_out, uint64_t *out_count);
+
+using GpuProbeU16Func = int (*)(const uint16_t *keys, const uint8_t *validity, uint64_t count, uint16_t min_value,
+                                uint16_t max_value, const uint8_t *build_bitmap, uint64_t build_size,
+                                uint32_t *probe_sel_out, uint32_t *build_sel_out, uint64_t *out_count);
+
+void *LoadGpuProbeLibrary() {
+	static bool attempted = false;
+	static void *handle = nullptr;
+
+	if (attempted) {
+		return handle;
+	}
+	attempted = true;
+
+	const char *path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+	if (!path || !path[0]) {
+		path = "libduckdb_gpu_probe.so";
+	}
+
+	handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (!handle) {
+		std::cerr << "[duckdb gpu join] dlopen failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+
+	std::cerr << "[duckdb gpu join] loaded " << path << std::endl;
+	return handle;
+}
+
+GpuProbeI64Func LoadGpuProbeI64() {
+	static bool attempted = false;
+	static GpuProbeI64Func fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuProbeLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuProbeI64Func>(dlsym(handle, "duckdb_gpu_probe_i64"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu join] dlsym i64 failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+GpuProbeU16Func LoadGpuProbeU16() {
+	static bool attempted = false;
+	static GpuProbeU16Func fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuProbeLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuProbeU16Func>(dlsym(handle, "duckdb_gpu_probe_u16"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu join] dlsym u16 failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+} // namespace
 
 PerfectHashJoinExecutor::PerfectHashJoinExecutor(const PhysicalHashJoin &join_p, JoinHashTable &ht_p)
     : join(join_p), ht(ht_p) {
@@ -270,6 +358,19 @@ OperatorResultType PerfectHashJoinExecutor::ProbePerfectHashTable(ExecutionConte
                                                                   DataChunk &lhs_output_columns, DataChunk &result,
                                                                   OperatorState &state_p) {
 	auto &state = state_p.Cast<PerfectHashJoinState>();
+	static std::atomic<bool> printed_gpu_probe_notice(false);
+	if (!printed_gpu_probe_notice.exchange(true)) {
+		std::cerr << "[duckdb gpu join] PerfectHashJoinExecutor::ProbePerfectHashTable reached" << std::endl;
+	}
+
+	const char *gpu_join = std::getenv("GPU_JOIN");
+	if (gpu_join && std::strcmp(gpu_join, "1") == 0) {
+		static std::atomic<bool> printed_gpu_join_enabled(false);
+		if (!printed_gpu_join_enabled.exchange(true)) {
+			std::cerr << "[duckdb gpu join] GPU_JOIN=1, GPU join candidate path" << std::endl;
+		}
+	}
+
 	// keeps track of how many probe keys have a match
 	idx_t probe_sel_count = 0;
 
@@ -338,9 +439,152 @@ void PerfectHashJoinExecutor::FillSelectionVectorSwitchProbe(Vector &source, Sel
 }
 
 template <typename T>
+bool PerfectHashJoinExecutor::TryGPUFillSelectionVectorProbe(Vector &source, SelectionVector &build_sel_vec,
+                                                             SelectionVector &probe_sel_vec, idx_t count,
+                                                             idx_t &probe_sel_count) {
+	static std::atomic<bool> printed(false);
+	if (!printed.exchange(true)) {
+		std::cerr << "[duckdb gpu join] TryGPUFillSelectionVectorProbe reached" << std::endl;
+	}
+
+	static std::atomic<bool> printed_type(false);
+	if (!printed_type.exchange(true)) {
+		std::cerr << "[duckdb gpu join] T info: "
+		          << "source_type=" << source.GetType().ToString() << ", sizeof(T)=" << sizeof(T)
+		          << ", integral=" << std::is_integral<T>::value << ", signed=" << std::is_signed<T>::value
+		          << std::endl;
+	}
+
+	if (source.GetType().InternalType() == PhysicalType::UINT16) {
+		auto gpu_probe_u16 = LoadGpuProbeU16();
+		if (!gpu_probe_u16) {
+			return false;
+		}
+
+		auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<uint16_t>();
+		auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<uint16_t>();
+		if (max_value < min_value) {
+			return false;
+		}
+
+		uint64_t build_size = static_cast<uint64_t>(max_value - min_value) + 1;
+		if (build_size == 0 || build_size > UINT32_MAX) {
+			return false;
+		}
+
+		UnifiedVectorFormat vector_data;
+		source.ToUnifiedFormat(count, vector_data);
+		auto data = reinterpret_cast<uint16_t *>(vector_data.data);
+
+		vector<uint16_t> keys;
+		vector<uint8_t> validity;
+		vector<uint8_t> build_bitmap;
+		vector<uint32_t> probe_out;
+		vector<uint32_t> build_out;
+
+		keys.resize(count);
+		validity.resize(count);
+		build_bitmap.resize(static_cast<idx_t>(build_size));
+		probe_out.resize(count);
+		build_out.resize(count);
+
+		for (idx_t i = 0; i < count; i++) {
+			auto data_idx = vector_data.sel->get_index(i);
+			keys[i] = data[data_idx];
+			validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
+		}
+		for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
+			build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+		}
+
+		uint64_t gpu_count = 0;
+		int rc = gpu_probe_u16(keys.data(), validity.data(), static_cast<uint64_t>(count), min_value, max_value,
+		                       build_bitmap.data(), build_size, probe_out.data(), build_out.data(), &gpu_count);
+		if (rc != 0 || gpu_count > static_cast<uint64_t>(count)) {
+			std::cerr << "[duckdb gpu join] GPU u16 probe failed, fallback CPU" << std::endl;
+			return false;
+		}
+
+		for (idx_t i = 0; i < static_cast<idx_t>(gpu_count); i++) {
+			probe_sel_vec.set_index(i, probe_out[i]);
+			build_sel_vec.set_index(i, build_out[i]);
+		}
+		probe_sel_count = static_cast<idx_t>(gpu_count);
+		return true;
+	}
+
+	if (source.GetType().InternalType() == PhysicalType::INT64) {
+		auto gpu_probe_i64 = LoadGpuProbeI64();
+		if (!gpu_probe_i64) {
+			return false;
+		}
+
+		auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<int64_t>();
+		auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<int64_t>();
+		if (max_value < min_value) {
+			return false;
+		}
+
+		uint64_t build_size = static_cast<uint64_t>(max_value - min_value) + 1;
+		if (build_size == 0 || build_size > UINT32_MAX) {
+			return false;
+		}
+
+		UnifiedVectorFormat vector_data;
+		source.ToUnifiedFormat(count, vector_data);
+		auto data = reinterpret_cast<int64_t *>(vector_data.data);
+
+		vector<int64_t> keys;
+		vector<uint8_t> validity;
+		vector<uint8_t> build_bitmap;
+		vector<uint32_t> probe_out;
+		vector<uint32_t> build_out;
+
+		keys.resize(count);
+		validity.resize(count);
+		build_bitmap.resize(static_cast<idx_t>(build_size));
+		probe_out.resize(count);
+		build_out.resize(count);
+
+		for (idx_t i = 0; i < count; i++) {
+			auto data_idx = vector_data.sel->get_index(i);
+			keys[i] = data[data_idx];
+			validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
+		}
+		for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
+			build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+		}
+
+		uint64_t gpu_count = 0;
+		int rc = gpu_probe_i64(keys.data(), validity.data(), static_cast<uint64_t>(count), min_value, max_value,
+		                       build_bitmap.data(), build_size, probe_out.data(), build_out.data(), &gpu_count);
+		if (rc != 0 || gpu_count > static_cast<uint64_t>(count)) {
+			std::cerr << "[duckdb gpu join] GPU i64 probe failed, fallback CPU" << std::endl;
+			return false;
+		}
+
+		for (idx_t i = 0; i < static_cast<idx_t>(gpu_count); i++) {
+			probe_sel_vec.set_index(i, probe_out[i]);
+			build_sel_vec.set_index(i, build_out[i]);
+		}
+		probe_sel_count = static_cast<idx_t>(gpu_count);
+		return true;
+	}
+
+	return false;
+}
+
+template <typename T>
 void PerfectHashJoinExecutor::TemplatedFillSelectionVectorProbe(Vector &source, SelectionVector &build_sel_vec,
                                                                 SelectionVector &probe_sel_vec, idx_t count,
                                                                 idx_t &probe_sel_count) {
+	const char *gpu_join = std::getenv("GPU_JOIN");
+	if (gpu_join && std::strcmp(gpu_join, "1") == 0) {
+		if (TryGPUFillSelectionVectorProbe<T>(source, build_sel_vec, probe_sel_vec, count, probe_sel_count)) {
+			return;
+		}
+	}
+
 	auto min_value = perfect_join_statistics.build_min.GetValueUnsafe<T>();
 	auto max_value = perfect_join_statistics.build_max.GetValueUnsafe<T>();
 
