@@ -469,8 +469,7 @@ optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups
 	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
 		static std::atomic<bool> printed_before_update_aggregates(false);
 		if (!printed_before_update_aggregates.exchange(true)) {
-			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups -> UpdateAggregates"
-			          << std::endl;
+			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups -> UpdateAggregates" << std::endl;
 		}
 	}
 

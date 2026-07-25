@@ -4,9 +4,9 @@
 #include "duckdb/execution/operator/join/physical_hash_join.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <cstdint>
 #include <dlfcn.h>
 #include <iostream>
 #include <type_traits>
