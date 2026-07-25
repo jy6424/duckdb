@@ -91,6 +91,17 @@ GpuProbeU16Func LoadGpuProbeU16() {
 	return fn;
 }
 
+struct GpuProbeScratch {
+	const void *executor = nullptr;
+	uint64_t build_size = 0;
+	vector<uint8_t> build_bitmap;
+	vector<uint8_t> validity;
+	vector<uint32_t> probe_out;
+	vector<uint32_t> build_out;
+	vector<int64_t> i64_keys;
+	vector<uint16_t> u16_keys;
+};
+
 } // namespace
 
 PerfectHashJoinExecutor::PerfectHashJoinExecutor(const PhysicalHashJoin &join_p, JoinHashTable &ht_p)
@@ -476,38 +487,39 @@ bool PerfectHashJoinExecutor::TryGPUFillSelectionVectorProbe(Vector &source, Sel
 		source.ToUnifiedFormat(count, vector_data);
 		auto data = reinterpret_cast<uint16_t *>(vector_data.data);
 
-		vector<uint16_t> keys;
-		vector<uint8_t> validity;
-		vector<uint8_t> build_bitmap;
-		vector<uint32_t> probe_out;
-		vector<uint32_t> build_out;
+		thread_local GpuProbeScratch scratch;
+		scratch.u16_keys.resize(count);
+		scratch.validity.resize(count);
+		scratch.probe_out.resize(count);
+		scratch.build_out.resize(count);
 
-		keys.resize(count);
-		validity.resize(count);
-		build_bitmap.resize(static_cast<idx_t>(build_size));
-		probe_out.resize(count);
-		build_out.resize(count);
+		if (scratch.executor != this || scratch.build_size != build_size) {
+			scratch.executor = this;
+			scratch.build_size = build_size;
+			scratch.build_bitmap.resize(static_cast<idx_t>(build_size));
+			for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
+				scratch.build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+			}
+		}
 
 		for (idx_t i = 0; i < count; i++) {
 			auto data_idx = vector_data.sel->get_index(i);
-			keys[i] = data[data_idx];
-			validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
-		}
-		for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
-			build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+			scratch.u16_keys[i] = data[data_idx];
+			scratch.validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
 		}
 
 		uint64_t gpu_count = 0;
-		int rc = gpu_probe_u16(keys.data(), validity.data(), static_cast<uint64_t>(count), min_value, max_value,
-		                       build_bitmap.data(), build_size, probe_out.data(), build_out.data(), &gpu_count);
+		int rc = gpu_probe_u16(scratch.u16_keys.data(), scratch.validity.data(), static_cast<uint64_t>(count),
+		                       min_value, max_value, scratch.build_bitmap.data(), build_size, scratch.probe_out.data(),
+		                       scratch.build_out.data(), &gpu_count);
 		if (rc != 0 || gpu_count > static_cast<uint64_t>(count)) {
 			std::cerr << "[duckdb gpu join] GPU u16 probe failed, fallback CPU" << std::endl;
 			return false;
 		}
 
 		for (idx_t i = 0; i < static_cast<idx_t>(gpu_count); i++) {
-			probe_sel_vec.set_index(i, probe_out[i]);
-			build_sel_vec.set_index(i, build_out[i]);
+			probe_sel_vec.set_index(i, scratch.probe_out[i]);
+			build_sel_vec.set_index(i, scratch.build_out[i]);
 		}
 		probe_sel_count = static_cast<idx_t>(gpu_count);
 		return true;
@@ -534,38 +546,39 @@ bool PerfectHashJoinExecutor::TryGPUFillSelectionVectorProbe(Vector &source, Sel
 		source.ToUnifiedFormat(count, vector_data);
 		auto data = reinterpret_cast<int64_t *>(vector_data.data);
 
-		vector<int64_t> keys;
-		vector<uint8_t> validity;
-		vector<uint8_t> build_bitmap;
-		vector<uint32_t> probe_out;
-		vector<uint32_t> build_out;
+		thread_local GpuProbeScratch scratch;
+		scratch.i64_keys.resize(count);
+		scratch.validity.resize(count);
+		scratch.probe_out.resize(count);
+		scratch.build_out.resize(count);
 
-		keys.resize(count);
-		validity.resize(count);
-		build_bitmap.resize(static_cast<idx_t>(build_size));
-		probe_out.resize(count);
-		build_out.resize(count);
+		if (scratch.executor != this || scratch.build_size != build_size) {
+			scratch.executor = this;
+			scratch.build_size = build_size;
+			scratch.build_bitmap.resize(static_cast<idx_t>(build_size));
+			for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
+				scratch.build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+			}
+		}
 
 		for (idx_t i = 0; i < count; i++) {
 			auto data_idx = vector_data.sel->get_index(i);
-			keys[i] = data[data_idx];
-			validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
-		}
-		for (idx_t i = 0; i < static_cast<idx_t>(build_size); i++) {
-			build_bitmap[i] = bitmap_build_idx.RowIsValid(i) ? 1 : 0;
+			scratch.i64_keys[i] = data[data_idx];
+			scratch.validity[i] = vector_data.validity.RowIsValid(data_idx) ? 1 : 0;
 		}
 
 		uint64_t gpu_count = 0;
-		int rc = gpu_probe_i64(keys.data(), validity.data(), static_cast<uint64_t>(count), min_value, max_value,
-		                       build_bitmap.data(), build_size, probe_out.data(), build_out.data(), &gpu_count);
+		int rc = gpu_probe_i64(scratch.i64_keys.data(), scratch.validity.data(), static_cast<uint64_t>(count),
+		                       min_value, max_value, scratch.build_bitmap.data(), build_size, scratch.probe_out.data(),
+		                       scratch.build_out.data(), &gpu_count);
 		if (rc != 0 || gpu_count > static_cast<uint64_t>(count)) {
 			std::cerr << "[duckdb gpu join] GPU i64 probe failed, fallback CPU" << std::endl;
 			return false;
 		}
 
 		for (idx_t i = 0; i < static_cast<idx_t>(gpu_count); i++) {
-			probe_sel_vec.set_index(i, probe_out[i]);
-			build_sel_vec.set_index(i, build_out[i]);
+			probe_sel_vec.set_index(i, scratch.probe_out[i]);
+			build_sel_vec.set_index(i, scratch.build_out[i]);
 		}
 		probe_sel_count = static_cast<idx_t>(gpu_count);
 		return true;
