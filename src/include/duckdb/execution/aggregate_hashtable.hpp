@@ -218,6 +218,7 @@ private:
 	void ReinsertTuples(PartitionedTupleData &data);
 
 	void UpdateAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter);
+	bool TryGPUUpdateCountAggregate(AggregateObject &aggr, DataChunk &payload, idx_t payload_idx);
 
 	//! Does the actual group matching / creation
 	idx_t FindOrCreateGroupsInternal(DataChunk &groups, Vector &group_hashes, Vector &addresses,

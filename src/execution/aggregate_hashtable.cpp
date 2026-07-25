@@ -13,11 +13,70 @@
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <iostream>
 
 namespace duckdb {
+
+namespace {
+
+using GpuGroupByCountFunc = int (*)(const uint64_t *addresses, const uint8_t *validity, uint64_t count,
+                                    uint64_t *unique_addresses_out, uint64_t *counts_out,
+                                    uint64_t *unique_count_out);
+
+void *LoadGpuGroupByLibrary() {
+	static bool attempted = false;
+	static void *handle = nullptr;
+
+	if (attempted) {
+		return handle;
+	}
+	attempted = true;
+
+	const char *path = std::getenv("DUCKDB_GPU_GROUPBY_LIB");
+	if (!path || !path[0]) {
+		path = std::getenv("DUCKDB_GPU_PROBE_LIB");
+	}
+	if (!path || !path[0]) {
+		path = "libduckdb_gpu_probe.so";
+	}
+
+	handle = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+	if (!handle) {
+		std::cerr << "[duckdb gpu groupby] dlopen failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+
+	std::cerr << "[duckdb gpu groupby] loaded " << path << std::endl;
+	return handle;
+}
+
+GpuGroupByCountFunc LoadGpuGroupByCount() {
+	static bool attempted = false;
+	static GpuGroupByCountFunc fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuGroupByLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuGroupByCountFunc>(dlsym(handle, "duckdb_gpu_groupby_count"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu groupby] dlsym count failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+} // namespace
 
 using ValidityBytes = TupleDataLayout::ValidityBytes;
 
@@ -575,7 +634,11 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 		}
 		D_ASSERT(i == filter[filter_idx]);
 
-		if (aggr.aggr_type != AggregateType::DISTINCT && aggr.filter) {
+		const char *gpu_groupby_count = std::getenv("GPU_GROUPBY");
+		if (gpu_groupby_count && std::strcmp(gpu_groupby_count, "1") == 0 &&
+		    TryGPUUpdateCountAggregate(aggr, payload, payload_idx)) {
+			// Count aggregate was updated by the experimental GPU path.
+		} else if (aggr.aggr_type != AggregateType::DISTINCT && aggr.filter) {
 			RowOperations::UpdateFilteredStates(state.row_state, filter_set.GetFilterData(i), aggr, state.addresses,
 			                                    payload, payload_idx);
 		} else {
@@ -589,6 +652,79 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 	}
 
 	Verify();
+}
+
+bool GroupedAggregateHashTable::TryGPUUpdateCountAggregate(AggregateObject &aggr, DataChunk &payload,
+                                                          idx_t payload_idx) {
+	if (aggr.aggr_type == AggregateType::DISTINCT || aggr.filter) {
+		return false;
+	}
+	if (aggr.function.name != "count" && aggr.function.name != "count_star") {
+		return false;
+	}
+	if (aggr.return_type != PhysicalType::INT64 || aggr.payload_size != sizeof(int64_t)) {
+		return false;
+	}
+	if (aggr.child_count > 1) {
+		return false;
+	}
+
+	auto gpu_count = LoadGpuGroupByCount();
+	if (!gpu_count) {
+		return false;
+	}
+
+	const auto count = payload.size();
+	if (count == 0) {
+		return true;
+	}
+
+	auto address_data = FlatVector::GetData<uintptr_t>(state.addresses);
+	vector<uint64_t> addresses;
+	vector<uint8_t> validity;
+	vector<uint64_t> unique_addresses;
+	vector<uint64_t> counts;
+
+	addresses.resize(count);
+	validity.resize(count);
+	unique_addresses.resize(count);
+	counts.resize(count);
+
+	for (idx_t i = 0; i < count; i++) {
+		addresses[i] = static_cast<uint64_t>(address_data[i]);
+	}
+
+	if (aggr.child_count == 0) {
+		for (idx_t i = 0; i < count; i++) {
+			validity[i] = 1;
+		}
+	} else {
+		UnifiedVectorFormat payload_data;
+		payload.data[payload_idx].ToUnifiedFormat(count, payload_data);
+		for (idx_t i = 0; i < count; i++) {
+			auto data_idx = payload_data.sel->get_index(i);
+			validity[i] = payload_data.validity.RowIsValid(data_idx) ? 1 : 0;
+		}
+	}
+
+	uint64_t unique_count = 0;
+	int rc = gpu_count(addresses.data(), validity.data(), static_cast<uint64_t>(count), unique_addresses.data(),
+	                   counts.data(), &unique_count);
+	if (rc != 0 || unique_count > static_cast<uint64_t>(count)) {
+		std::cerr << "[duckdb gpu groupby] GPU count failed, fallback CPU" << std::endl;
+		return false;
+	}
+
+	for (idx_t i = 0; i < static_cast<idx_t>(unique_count); i++) {
+		auto state_ptr = reinterpret_cast<int64_t *>(static_cast<uintptr_t>(unique_addresses[i]));
+		*state_ptr += static_cast<int64_t>(counts[i]);
+	}
+
+	static std::atomic<bool> printed_count_success(false);
+	if (!printed_count_success.exchange(true)) {
+		std::cerr << "[duckdb gpu groupby] count aggregate updated on GPU" << std::endl;
+	}
+	return true;
 }
 
 idx_t GroupedAggregateHashTable::AddChunk(DataChunk &groups, Vector &group_hashes, DataChunk &payload,
