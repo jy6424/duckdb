@@ -36,6 +36,11 @@ using GpuGroupByStatsDoubleFunc = int (*)(const uint64_t *addresses, const doubl
                                           uint64_t *counts_out, double *mins_out, double *maxs_out,
                                           uint64_t *unique_count_out);
 
+using GpuGroupByDictStatsDoubleFunc = int (*)(const uint32_t *group_ids, const double *values,
+                                              const uint8_t *validity, uint64_t count, uint64_t group_count,
+                                              double *sums_out, uint64_t *counts_out, uint64_t *row_counts_out,
+                                              double *mins_out, double *maxs_out);
+
 void *LoadGpuGroupByLibrary() {
 	static bool attempted = false;
 	static void *handle = nullptr;
@@ -124,6 +129,28 @@ GpuGroupByStatsDoubleFunc LoadGpuGroupByStatsDouble() {
 	fn = reinterpret_cast<GpuGroupByStatsDoubleFunc>(dlsym(handle, "duckdb_gpu_groupby_stats_double"));
 	if (!fn) {
 		std::cerr << "[duckdb gpu groupby] dlsym stats double failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+GpuGroupByDictStatsDoubleFunc LoadGpuGroupByDictStatsDouble() {
+	static bool attempted = false;
+	static GpuGroupByDictStatsDoubleFunc fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuGroupByLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuGroupByDictStatsDoubleFunc>(dlsym(handle, "duckdb_gpu_groupby_dict_stats_double"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu groupby] dlsym dict stats double failed: " << dlerror() << std::endl;
 		return nullptr;
 	}
 	return fn;
@@ -488,6 +515,238 @@ GroupedAggregateHashTable::AggregateDictionaryState::AggregateDictionaryState()
     : hashes(LogicalType::HASH), new_dictionary_pointers(LogicalType::POINTER), unique_entries(STANDARD_VECTOR_SIZE) {
 }
 
+bool GroupedAggregateHashTable::TryGPUUpdateDictionaryAggregates(DataChunk &payload,
+                                                                 const unsafe_vector<idx_t> &filter,
+                                                                 const SelectionVector &offsets,
+                                                                 const uintptr_t *dict_addresses, idx_t count,
+                                                                 idx_t dict_size) {
+	if (count == 0 || dict_size == 0) {
+		return true;
+	}
+	if (dict_size > UINT32_MAX) {
+		return false;
+	}
+
+	auto gpu_stats = LoadGpuGroupByDictStatsDouble();
+	if (!gpu_stats) {
+		return false;
+	}
+
+	auto &aggregates = layout_ptr->GetAggregates();
+	idx_t filter_idx = 0;
+	idx_t payload_idx = 0;
+	bool has_supported_aggregate = false;
+
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto &aggr = aggregates[i];
+		const bool selected = filter_idx < filter.size() && i == filter[filter_idx];
+		if (!selected) {
+			payload_idx += aggr.child_count;
+			continue;
+		}
+
+		if (aggr.aggr_type == AggregateType::DISTINCT || aggr.filter) {
+			return false;
+		}
+
+		const bool is_count = aggr.function.name == "count" || aggr.function.name == "count_star";
+		const bool is_sum = aggr.function.name == "sum";
+		const bool is_avg = aggr.function.name == "avg";
+		const bool is_min = aggr.function.name == "min";
+		const bool is_max = aggr.function.name == "max";
+		if (!is_count && !is_sum && !is_avg && !is_min && !is_max) {
+			return false;
+		}
+		if (is_count) {
+			if (aggr.return_type != PhysicalType::INT64 || aggr.payload_size != sizeof(int64_t) ||
+			    aggr.child_count > 1) {
+				return false;
+			}
+			if (aggr.child_count == 1 && payload_idx >= payload.ColumnCount()) {
+				return false;
+			}
+		} else {
+			if (aggr.child_count != 1 || payload_idx >= payload.ColumnCount() ||
+			    payload.data[payload_idx].GetType().InternalType() != PhysicalType::DOUBLE ||
+			    aggr.return_type != PhysicalType::DOUBLE) {
+				return false;
+			}
+			if (is_sum && aggr.payload_size < sizeof(GpuSumDoubleState)) {
+				return false;
+			}
+			if (is_avg && aggr.payload_size < sizeof(GpuAvgDoubleState)) {
+				return false;
+			}
+			if ((is_min || is_max) && aggr.payload_size < sizeof(GpuMinMaxDoubleState)) {
+				return false;
+			}
+		}
+
+		has_supported_aggregate = true;
+		payload_idx += aggr.child_count;
+		filter_idx++;
+	}
+
+	if (!has_supported_aggregate) {
+		return false;
+	}
+
+	struct DictStatsResult {
+		bool computed = false;
+		vector<double> sums;
+		vector<uint64_t> counts;
+		vector<uint64_t> row_counts;
+		vector<double> mins;
+		vector<double> maxs;
+	};
+
+	vector<uint32_t> group_ids;
+	group_ids.resize(count);
+	for (idx_t row = 0; row < count; row++) {
+		group_ids[row] = static_cast<uint32_t>(offsets.get_index(row));
+	}
+
+	vector<DictStatsResult> payload_stats;
+	payload_stats.resize(payload.ColumnCount());
+	DictStatsResult count_star_stats;
+
+	auto run_stats = [&](DictStatsResult &result, idx_t payload_column, bool has_payload) {
+		if (result.computed) {
+			return true;
+		}
+
+		vector<double> values;
+		vector<uint8_t> validity;
+		values.resize(count);
+		validity.resize(count);
+
+		if (has_payload) {
+			UnifiedVectorFormat payload_data;
+			payload.data[payload_column].ToUnifiedFormat(count, payload_data);
+			const bool is_double = payload.data[payload_column].GetType().InternalType() == PhysicalType::DOUBLE;
+			auto double_values = is_double ? reinterpret_cast<double *>(payload_data.data) : nullptr;
+			for (idx_t row = 0; row < count; row++) {
+				auto data_idx = payload_data.sel->get_index(row);
+				if (payload_data.validity.RowIsValid(data_idx)) {
+					validity[row] = 1;
+					values[row] = is_double ? double_values[data_idx] : 0;
+				} else {
+					validity[row] = 0;
+					values[row] = 0;
+				}
+			}
+		} else {
+			for (idx_t row = 0; row < count; row++) {
+				values[row] = 0;
+				validity[row] = 1;
+			}
+		}
+
+		result.sums.resize(dict_size);
+		result.counts.resize(dict_size);
+		result.row_counts.resize(dict_size);
+		result.mins.resize(dict_size);
+		result.maxs.resize(dict_size);
+
+		int rc = gpu_stats(group_ids.data(), values.data(), validity.data(), static_cast<uint64_t>(count),
+		                   static_cast<uint64_t>(dict_size), result.sums.data(), result.counts.data(),
+		                   result.row_counts.data(), result.mins.data(), result.maxs.data());
+		if (rc != 0) {
+			std::cerr << "[duckdb gpu groupby] GPU dictionary stats failed, fallback CPU" << std::endl;
+			return false;
+		}
+		result.computed = true;
+		return true;
+	};
+
+	filter_idx = 0;
+	payload_idx = 0;
+	idx_t aggregate_offset = 0;
+	for (idx_t i = 0; i < aggregates.size(); i++) {
+		auto &aggr = aggregates[i];
+		const bool selected = filter_idx < filter.size() && i == filter[filter_idx];
+		if (!selected) {
+			payload_idx += aggr.child_count;
+			aggregate_offset += aggr.payload_size;
+			continue;
+		}
+
+		DictStatsResult *stats = nullptr;
+		if (aggr.child_count == 0) {
+			if (!run_stats(count_star_stats, 0, false)) {
+				return false;
+			}
+			stats = &count_star_stats;
+		} else {
+			if (!run_stats(payload_stats[payload_idx], payload_idx, true)) {
+				return false;
+			}
+			stats = &payload_stats[payload_idx];
+		}
+
+		const bool is_count = aggr.function.name == "count" || aggr.function.name == "count_star";
+		const bool is_sum = aggr.function.name == "sum";
+		const bool is_avg = aggr.function.name == "avg";
+		const bool is_min = aggr.function.name == "min";
+		const bool is_max = aggr.function.name == "max";
+
+		for (idx_t group_idx = 0; group_idx < dict_size; group_idx++) {
+			const auto row_count = stats->row_counts[group_idx];
+			const auto value_count = stats->counts[group_idx];
+			if (row_count == 0 && value_count == 0) {
+				continue;
+			}
+
+			auto state_address = dict_addresses[group_idx] + aggregate_offset;
+			if (is_count) {
+				const auto count_delta = aggr.child_count == 0 ? row_count : value_count;
+				if (count_delta > 0) {
+					auto state_ptr = reinterpret_cast<int64_t *>(state_address);
+					*state_ptr += static_cast<int64_t>(count_delta);
+				}
+			} else if (is_sum) {
+				if (value_count > 0) {
+					auto state_ptr = reinterpret_cast<GpuSumDoubleState *>(state_address);
+					state_ptr->isset = true;
+					state_ptr->value += stats->sums[group_idx];
+				}
+			} else if (is_avg) {
+				if (value_count > 0) {
+					auto state_ptr = reinterpret_cast<GpuAvgDoubleState *>(state_address);
+					state_ptr->count += value_count;
+					state_ptr->value += stats->sums[group_idx];
+				}
+			} else if (is_min) {
+				if (value_count > 0) {
+					auto state_ptr = reinterpret_cast<GpuMinMaxDoubleState *>(state_address);
+					if (!state_ptr->isset || stats->mins[group_idx] < state_ptr->value) {
+						state_ptr->value = stats->mins[group_idx];
+					}
+					state_ptr->isset = true;
+				}
+			} else if (is_max) {
+				if (value_count > 0) {
+					auto state_ptr = reinterpret_cast<GpuMinMaxDoubleState *>(state_address);
+					if (!state_ptr->isset || stats->maxs[group_idx] > state_ptr->value) {
+						state_ptr->value = stats->maxs[group_idx];
+					}
+					state_ptr->isset = true;
+				}
+			}
+		}
+
+		payload_idx += aggr.child_count;
+		aggregate_offset += aggr.payload_size;
+		filter_idx++;
+	}
+
+	static std::atomic<bool> printed_dictionary_success(false);
+	if (!printed_dictionary_success.exchange(true)) {
+		std::cerr << "[duckdb gpu groupby] dictionary aggregate updated on GPU" << std::endl;
+	}
+	return true;
+}
+
 optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups, DataChunk &payload,
                                                                const unsafe_vector<idx_t> &filter) {
 	const char *gpu_groupby = std::getenv("GPU_GROUPBY");
@@ -596,11 +855,18 @@ optional_idx GroupedAggregateHashTable::TryAddDictionaryGroups(DataChunk &groups
 	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
 		static std::atomic<bool> printed_before_update_aggregates(false);
 		if (!printed_before_update_aggregates.exchange(true)) {
-			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups -> UpdateAggregates" << std::endl;
+			std::cerr << "[duckdb gpu groupby] GPU_GROUPBY=1, TryAddDictionaryGroups aggregate update" << std::endl;
 		}
 	}
 
-	UpdateAggregates(payload, filter);
+	bool updated_on_gpu = false;
+	if (gpu_groupby && std::strcmp(gpu_groupby, "1") == 0) {
+		updated_on_gpu =
+		    TryGPUUpdateDictionaryAggregates(payload, filter, offsets, dict_addresses, groups.size(), dict_size);
+	}
+	if (!updated_on_gpu) {
+		UpdateAggregates(payload, filter);
+	}
 
 	return new_group_count;
 }
