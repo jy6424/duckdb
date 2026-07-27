@@ -27,6 +27,15 @@ using GpuGroupByCountFunc = int (*)(const uint64_t *addresses, const uint8_t *va
                                     uint64_t *unique_addresses_out, uint64_t *counts_out,
                                     uint64_t *unique_count_out);
 
+using GpuGroupBySumDoubleFunc = int (*)(const uint64_t *addresses, const double *values, const uint8_t *validity,
+                                        uint64_t count, uint64_t *unique_addresses_out, double *sums_out,
+                                        uint64_t *unique_count_out);
+
+using GpuGroupByStatsDoubleFunc = int (*)(const uint64_t *addresses, const double *values, const uint8_t *validity,
+                                          uint64_t count, uint64_t *unique_addresses_out, double *sums_out,
+                                          uint64_t *counts_out, double *mins_out, double *maxs_out,
+                                          uint64_t *unique_count_out);
+
 void *LoadGpuGroupByLibrary() {
 	static bool attempted = false;
 	static void *handle = nullptr;
@@ -75,6 +84,65 @@ GpuGroupByCountFunc LoadGpuGroupByCount() {
 	}
 	return fn;
 }
+
+GpuGroupBySumDoubleFunc LoadGpuGroupBySumDouble() {
+	static bool attempted = false;
+	static GpuGroupBySumDoubleFunc fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuGroupByLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuGroupBySumDoubleFunc>(dlsym(handle, "duckdb_gpu_groupby_sum_double"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu groupby] dlsym sum double failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+GpuGroupByStatsDoubleFunc LoadGpuGroupByStatsDouble() {
+	static bool attempted = false;
+	static GpuGroupByStatsDoubleFunc fn = nullptr;
+
+	if (attempted) {
+		return fn;
+	}
+	attempted = true;
+
+	auto handle = LoadGpuGroupByLibrary();
+	if (!handle) {
+		return nullptr;
+	}
+
+	fn = reinterpret_cast<GpuGroupByStatsDoubleFunc>(dlsym(handle, "duckdb_gpu_groupby_stats_double"));
+	if (!fn) {
+		std::cerr << "[duckdb gpu groupby] dlsym stats double failed: " << dlerror() << std::endl;
+		return nullptr;
+	}
+	return fn;
+}
+
+struct GpuSumDoubleState {
+	bool isset;
+	double value;
+};
+
+struct GpuAvgDoubleState {
+	uint64_t count;
+	double value;
+};
+
+struct GpuMinMaxDoubleState {
+	double value;
+	bool isset;
+};
 
 } // namespace
 
@@ -638,6 +706,12 @@ void GroupedAggregateHashTable::UpdateAggregates(DataChunk &payload, const unsaf
 		if (gpu_groupby_count && std::strcmp(gpu_groupby_count, "1") == 0 &&
 		    TryGPUUpdateCountAggregate(aggr, payload, payload_idx)) {
 			// Count aggregate was updated by the experimental GPU path.
+		} else if (gpu_groupby_count && std::strcmp(gpu_groupby_count, "1") == 0 &&
+		           TryGPUUpdateSumDoubleAggregate(aggr, payload, payload_idx)) {
+			// Double SUM aggregate was updated by the experimental GPU path.
+		} else if (gpu_groupby_count && std::strcmp(gpu_groupby_count, "1") == 0 &&
+		           TryGPUUpdateDoubleStatsAggregate(aggr, payload, payload_idx)) {
+			// Double AVG/MIN/MAX aggregate was updated by the experimental GPU path.
 		} else if (aggr.aggr_type != AggregateType::DISTINCT && aggr.filter) {
 			RowOperations::UpdateFilteredStates(state.row_state, filter_set.GetFilterData(i), aggr, state.addresses,
 			                                    payload, payload_idx);
@@ -723,6 +797,197 @@ bool GroupedAggregateHashTable::TryGPUUpdateCountAggregate(AggregateObject &aggr
 	static std::atomic<bool> printed_count_success(false);
 	if (!printed_count_success.exchange(true)) {
 		std::cerr << "[duckdb gpu groupby] count aggregate updated on GPU" << std::endl;
+	}
+	return true;
+}
+
+bool GroupedAggregateHashTable::TryGPUUpdateSumDoubleAggregate(AggregateObject &aggr, DataChunk &payload,
+                                                              idx_t payload_idx) {
+	if (aggr.aggr_type == AggregateType::DISTINCT || aggr.filter) {
+		return false;
+	}
+	if (aggr.function.name != "sum") {
+		return false;
+	}
+	if (aggr.child_count != 1) {
+		return false;
+	}
+	if (payload_idx >= payload.ColumnCount()) {
+		return false;
+	}
+	if (payload.data[payload_idx].GetType().InternalType() != PhysicalType::DOUBLE) {
+		return false;
+	}
+	if (aggr.return_type != PhysicalType::DOUBLE || aggr.payload_size < sizeof(GpuSumDoubleState)) {
+		return false;
+	}
+
+	auto gpu_sum = LoadGpuGroupBySumDouble();
+	if (!gpu_sum) {
+		return false;
+	}
+
+	const auto count = payload.size();
+	if (count == 0) {
+		return true;
+	}
+
+	auto address_data = FlatVector::GetData<uintptr_t>(state.addresses);
+	vector<uint64_t> addresses;
+	vector<double> values;
+	vector<uint8_t> validity;
+	vector<uint64_t> unique_addresses;
+	vector<double> sums;
+
+	addresses.resize(count);
+	values.resize(count);
+	validity.resize(count);
+	unique_addresses.resize(count);
+	sums.resize(count);
+
+	UnifiedVectorFormat payload_data;
+	payload.data[payload_idx].ToUnifiedFormat(count, payload_data);
+	auto payload_values = reinterpret_cast<double *>(payload_data.data);
+
+	for (idx_t i = 0; i < count; i++) {
+		addresses[i] = static_cast<uint64_t>(address_data[i]);
+		auto data_idx = payload_data.sel->get_index(i);
+		if (payload_data.validity.RowIsValid(data_idx)) {
+			values[i] = payload_values[data_idx];
+			validity[i] = 1;
+		} else {
+			values[i] = 0;
+			validity[i] = 0;
+		}
+	}
+
+	uint64_t unique_count = 0;
+	int rc = gpu_sum(addresses.data(), values.data(), validity.data(), static_cast<uint64_t>(count),
+	                 unique_addresses.data(), sums.data(), &unique_count);
+	if (rc != 0 || unique_count > static_cast<uint64_t>(count)) {
+		std::cerr << "[duckdb gpu groupby] GPU sum double failed, fallback CPU" << std::endl;
+		return false;
+	}
+
+	for (idx_t i = 0; i < static_cast<idx_t>(unique_count); i++) {
+		auto state_ptr = reinterpret_cast<GpuSumDoubleState *>(static_cast<uintptr_t>(unique_addresses[i]));
+		state_ptr->isset = true;
+		state_ptr->value += sums[i];
+	}
+
+	static std::atomic<bool> printed_sum_success(false);
+	if (!printed_sum_success.exchange(true)) {
+		std::cerr << "[duckdb gpu groupby] sum(double) aggregate updated on GPU" << std::endl;
+	}
+	return true;
+}
+
+bool GroupedAggregateHashTable::TryGPUUpdateDoubleStatsAggregate(AggregateObject &aggr, DataChunk &payload,
+                                                                idx_t payload_idx) {
+	if (aggr.aggr_type == AggregateType::DISTINCT || aggr.filter) {
+		return false;
+	}
+	const bool is_avg = aggr.function.name == "avg";
+	const bool is_min = aggr.function.name == "min";
+	const bool is_max = aggr.function.name == "max";
+	if (!is_avg && !is_min && !is_max) {
+		return false;
+	}
+	if (aggr.child_count != 1) {
+		return false;
+	}
+	if (payload_idx >= payload.ColumnCount()) {
+		return false;
+	}
+	if (payload.data[payload_idx].GetType().InternalType() != PhysicalType::DOUBLE) {
+		return false;
+	}
+	if (aggr.return_type != PhysicalType::DOUBLE) {
+		return false;
+	}
+	if (is_avg && aggr.payload_size < sizeof(GpuAvgDoubleState)) {
+		return false;
+	}
+	if ((is_min || is_max) && aggr.payload_size < sizeof(GpuMinMaxDoubleState)) {
+		return false;
+	}
+
+	auto gpu_stats = LoadGpuGroupByStatsDouble();
+	if (!gpu_stats) {
+		return false;
+	}
+
+	const auto count = payload.size();
+	if (count == 0) {
+		return true;
+	}
+
+	auto address_data = FlatVector::GetData<uintptr_t>(state.addresses);
+	vector<uint64_t> addresses;
+	vector<double> values;
+	vector<uint8_t> validity;
+	vector<uint64_t> unique_addresses;
+	vector<double> sums;
+	vector<uint64_t> counts;
+	vector<double> mins;
+	vector<double> maxs;
+
+	addresses.resize(count);
+	values.resize(count);
+	validity.resize(count);
+	unique_addresses.resize(count);
+	sums.resize(count);
+	counts.resize(count);
+	mins.resize(count);
+	maxs.resize(count);
+
+	UnifiedVectorFormat payload_data;
+	payload.data[payload_idx].ToUnifiedFormat(count, payload_data);
+	auto payload_values = reinterpret_cast<double *>(payload_data.data);
+
+	for (idx_t i = 0; i < count; i++) {
+		addresses[i] = static_cast<uint64_t>(address_data[i]);
+		auto data_idx = payload_data.sel->get_index(i);
+		if (payload_data.validity.RowIsValid(data_idx)) {
+			values[i] = payload_values[data_idx];
+			validity[i] = 1;
+		} else {
+			values[i] = 0;
+			validity[i] = 0;
+		}
+	}
+
+	uint64_t unique_count = 0;
+	int rc = gpu_stats(addresses.data(), values.data(), validity.data(), static_cast<uint64_t>(count),
+	                   unique_addresses.data(), sums.data(), counts.data(), mins.data(), maxs.data(), &unique_count);
+	if (rc != 0 || unique_count > static_cast<uint64_t>(count)) {
+		std::cerr << "[duckdb gpu groupby] GPU double stats failed, fallback CPU" << std::endl;
+		return false;
+	}
+
+	for (idx_t i = 0; i < static_cast<idx_t>(unique_count); i++) {
+		auto state_address = static_cast<uintptr_t>(unique_addresses[i]);
+		if (is_avg) {
+			auto state_ptr = reinterpret_cast<GpuAvgDoubleState *>(state_address);
+			state_ptr->count += counts[i];
+			state_ptr->value += sums[i];
+		} else {
+			auto state_ptr = reinterpret_cast<GpuMinMaxDoubleState *>(state_address);
+			const auto value = is_min ? mins[i] : maxs[i];
+			if (!state_ptr->isset) {
+				state_ptr->value = value;
+				state_ptr->isset = true;
+			} else if (is_min && value < state_ptr->value) {
+				state_ptr->value = value;
+			} else if (is_max && value > state_ptr->value) {
+				state_ptr->value = value;
+			}
+		}
+	}
+
+	static std::atomic<bool> printed_stats_success(false);
+	if (!printed_stats_success.exchange(true)) {
+		std::cerr << "[duckdb gpu groupby] avg/min/max double aggregate updated on GPU" << std::endl;
 	}
 	return true;
 }
