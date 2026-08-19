@@ -13,7 +13,9 @@
 #include "duckdb/logging/log_manager.hpp"
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <sys/stat.h>
 
@@ -49,7 +51,15 @@ extern "C" WINBASEAPI BOOL QueryFullProcessImageNameW(HANDLE, DWORD, LPWSTR, PDW
 #define _GNU_SOURCE /* See feature_test_macros(7) */
 #endif
 #include <fcntl.h>
+#if defined(__has_include)
+#if __has_include(<linux/io_uring.h>)
+#define DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING 1
+#include <linux/io_uring.h>
+#endif
+#endif
 #include <libgen.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 // See e.g.:
 // https://opensource.apple.com/source/CarbonHeaders/CarbonHeaders-18.1/TargetConditionals.h.auto.html
 #elif defined(__APPLE__)
@@ -481,13 +491,207 @@ idx_t LocalFileSystem::GetFilePointer(FileHandle &handle) {
 	return UnsafeNumericCast<idx_t>(position);
 }
 
+#if defined(DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+class LocalIoUringReader {
+public:
+	~LocalIoUringReader() {
+		Close();
+	}
+
+	bool Available() {
+		if (disabled) {
+			return false;
+		}
+		if (initialized) {
+			return true;
+		}
+		return Init();
+	}
+
+	bool Read(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position, int64_t &bytes_read,
+	          int &error_number) {
+		if (!Available()) {
+			return false;
+		}
+
+		auto tail = *sq_tail;
+		auto index = tail & *sq_ring_mask;
+		auto &sqe = sqes[index];
+		memset(&sqe, 0, sizeof(sqe));
+		sqe.opcode = IORING_OP_READ;
+		sqe.fd = fd;
+		sqe.off = use_file_position ? static_cast<uint64_t>(-1) : UnsafeNumericCast<uint64_t>(location);
+		sqe.addr = reinterpret_cast<uint64_t>(buffer);
+		sqe.len = UnsafeNumericCast<uint32_t>(nr_bytes);
+		sq_array[index] = index;
+		std::atomic_thread_fence(std::memory_order_release);
+		*sq_tail = tail + 1;
+
+		auto enter_result = syscall(SYS_io_uring_enter, ring_fd, 1, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+		if (enter_result < 0) {
+			error_number = errno;
+			Close();
+			disabled = true;
+			return false;
+		}
+
+		while (true) {
+			auto head = *cq_head;
+			std::atomic_thread_fence(std::memory_order_acquire);
+			auto cq_tail_value = *cq_tail;
+			if (head == cq_tail_value) {
+				enter_result = syscall(SYS_io_uring_enter, ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+				if (enter_result < 0) {
+					error_number = errno;
+					Close();
+					disabled = true;
+					return false;
+				}
+				continue;
+			}
+
+			auto &cqe = cqes[head & *cq_ring_mask];
+			auto result = cqe.res;
+			*cq_head = head + 1;
+			if (result < 0) {
+				error_number = -result;
+				if (error_number == EINVAL || error_number == ESPIPE || error_number == EOPNOTSUPP ||
+				    error_number == EPERM) {
+					bytes_read = 0;
+					return false;
+				}
+				bytes_read = -1;
+				return true;
+			}
+			bytes_read = result;
+			error_number = 0;
+			return true;
+		}
+	}
+
+private:
+	bool Init() {
+		struct io_uring_params params;
+		memset(&params, 0, sizeof(params));
+		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 8, &params));
+		if (ring_fd < 0) {
+			disabled = true;
+			return false;
+		}
+
+		sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(uint32_t);
+		cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
+		sqes_size = params.sq_entries * sizeof(struct io_uring_sqe);
+
+		sq_ring = mmap(nullptr, sq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_SQ_RING);
+		cq_ring = mmap(nullptr, cq_ring_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_CQ_RING);
+		sqes = static_cast<struct io_uring_sqe *>(
+		    mmap(nullptr, sqes_size, PROT_READ | PROT_WRITE, MAP_SHARED, ring_fd, IORING_OFF_SQES));
+		if (sq_ring == MAP_FAILED || cq_ring == MAP_FAILED || reinterpret_cast<void *>(sqes) == MAP_FAILED) {
+			Close();
+			disabled = true;
+			return false;
+		}
+
+		sq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.head);
+		sq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.tail);
+		sq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.ring_mask);
+		sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.array);
+
+		cq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.head);
+		cq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.tail);
+		cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.ring_mask);
+		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
+		initialized = true;
+		return true;
+	}
+
+	void Close() {
+		if (sq_ring && sq_ring != MAP_FAILED) {
+			munmap(sq_ring, sq_ring_size);
+		}
+		if (cq_ring && cq_ring != MAP_FAILED) {
+			munmap(cq_ring, cq_ring_size);
+		}
+		if (sqes && reinterpret_cast<void *>(sqes) != MAP_FAILED) {
+			munmap(sqes, sqes_size);
+		}
+		if (ring_fd >= 0) {
+			close(ring_fd);
+		}
+		ring_fd = -1;
+		sq_ring = nullptr;
+		cq_ring = nullptr;
+		sqes = nullptr;
+		initialized = false;
+	}
+
+	bool initialized = false;
+	bool disabled = false;
+	int ring_fd = -1;
+	void *sq_ring = nullptr;
+	void *cq_ring = nullptr;
+	struct io_uring_sqe *sqes = nullptr;
+	struct io_uring_cqe *cqes = nullptr;
+	size_t sq_ring_size = 0;
+	size_t cq_ring_size = 0;
+	size_t sqes_size = 0;
+	uint32_t *sq_head = nullptr;
+	uint32_t *sq_tail = nullptr;
+	uint32_t *sq_ring_mask = nullptr;
+	uint32_t *sq_array = nullptr;
+	uint32_t *cq_head = nullptr;
+	uint32_t *cq_tail = nullptr;
+	uint32_t *cq_ring_mask = nullptr;
+};
+
+static bool LocalIoUringEnabled() {
+	auto value = std::getenv("DUCKDB_LOCAL_IO_URING");
+	if (!value || !value[0]) {
+		return false;
+	}
+	auto enabled = strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+	               strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+	               strcmp(value, "ON") == 0;
+	if (enabled) {
+		static std::atomic<bool> printed(false);
+		if (!printed.exchange(true)) {
+			fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING=1\n");
+		}
+	}
+	return enabled;
+}
+
+static bool TryLocalIoUringRead(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position,
+                                int64_t &bytes_read, int &error_number) {
+	if (!LocalIoUringEnabled() || nr_bytes > NumericLimits<uint32_t>::Maximum()) {
+		return false;
+	}
+	thread_local LocalIoUringReader reader;
+	return reader.Read(fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number);
+}
+#endif
+
 void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto bytes_to_read = nr_bytes;
 	int fd = handle.Cast<UnixFileHandle>().fd;
 	auto read_buffer = char_ptr_cast(buffer);
 	while (nr_bytes > 0) {
-		int64_t bytes_read =
-		    pread(fd, read_buffer, UnsafeNumericCast<size_t>(nr_bytes), UnsafeNumericCast<off_t>(location));
+		int64_t bytes_read;
+#if defined(DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+		int io_uring_error = 0;
+		if (TryLocalIoUringRead(fd, read_buffer, UnsafeNumericCast<size_t>(nr_bytes),
+		                        UnsafeNumericCast<int64_t>(location), false, bytes_read, io_uring_error)) {
+			if (bytes_read == -1) {
+				throw IOException({{"errno", std::to_string(io_uring_error)}},
+				                  "Could not read from file \"%s\": %s", handle.path, strerror(io_uring_error));
+			}
+		} else
+#endif
+		{
+			bytes_read =
+			    pread(fd, read_buffer, UnsafeNumericCast<size_t>(nr_bytes), UnsafeNumericCast<off_t>(location));
+		}
 		if (bytes_read == -1) {
 			throw IOException({{"errno", std::to_string(errno)}}, "Could not read from file \"%s\": %s", handle.path,
 			                  strerror(errno));
@@ -508,7 +712,19 @@ void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, i
 int64_t LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes) {
 	auto &unix_handle = handle.Cast<UnixFileHandle>();
 	int fd = unix_handle.fd;
-	int64_t bytes_read = read(fd, buffer, UnsafeNumericCast<size_t>(nr_bytes));
+	int64_t bytes_read;
+#if defined(DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
+	int io_uring_error = 0;
+	if (TryLocalIoUringRead(fd, buffer, UnsafeNumericCast<size_t>(nr_bytes), 0, true, bytes_read, io_uring_error)) {
+		if (bytes_read == -1) {
+			throw IOException({{"errno", std::to_string(io_uring_error)}}, "Could not read from file \"%s\": %s",
+			                  handle.path, strerror(io_uring_error));
+		}
+	} else
+#endif
+	{
+		bytes_read = read(fd, buffer, UnsafeNumericCast<size_t>(nr_bytes));
+	}
 	if (bytes_read == -1) {
 		throw IOException({{"errno", std::to_string(errno)}}, "Could not read from file \"%s\": %s", handle.path,
 		                  strerror(errno));
