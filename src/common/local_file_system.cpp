@@ -60,6 +60,7 @@ extern "C" WINBASEAPI BOOL QueryFullProcessImageNameW(HANDLE, DWORD, LPWSTR, PDW
 #include <libgen.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 // See e.g.:
 // https://opensource.apple.com/source/CarbonHeaders/CarbonHeaders-18.1/TargetConditionals.h.auto.html
 #elif defined(__APPLE__)
@@ -517,12 +518,21 @@ public:
 		auto tail = *sq_tail;
 		auto index = tail & *sq_ring_mask;
 		auto &sqe = sqes[index];
+		struct iovec iov;
 		memset(&sqe, 0, sizeof(sqe));
+#if defined(IORING_OP_READ)
 		sqe.opcode = IORING_OP_READ;
-		sqe.fd = fd;
-		sqe.off = use_file_position ? static_cast<uint64_t>(-1) : UnsafeNumericCast<uint64_t>(location);
 		sqe.addr = reinterpret_cast<uint64_t>(buffer);
 		sqe.len = UnsafeNumericCast<uint32_t>(nr_bytes);
+#else
+		iov.iov_base = buffer;
+		iov.iov_len = nr_bytes;
+		sqe.opcode = IORING_OP_READV;
+		sqe.addr = reinterpret_cast<uint64_t>(&iov);
+		sqe.len = 1;
+#endif
+		sqe.fd = fd;
+		sqe.off = use_file_position ? static_cast<uint64_t>(-1) : UnsafeNumericCast<uint64_t>(location);
 		sq_array[index] = index;
 		std::atomic_thread_fence(std::memory_order_release);
 		*sq_tail = tail + 1;
