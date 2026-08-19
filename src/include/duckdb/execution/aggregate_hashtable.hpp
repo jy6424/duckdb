@@ -221,6 +221,9 @@ private:
 	bool TryGPUUpdateDictionaryAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter,
 	                                      const SelectionVector &offsets, const uintptr_t *dict_addresses,
 	                                      idx_t count, idx_t dict_size);
+	bool TryGPUUpdateDictionaryMultiSumAggregates(DataChunk &payload, const unsafe_vector<idx_t> &filter,
+	                                              const SelectionVector &offsets, const uintptr_t *dict_addresses,
+	                                              idx_t count, idx_t dict_size);
 	bool TryGPUUpdateCountAggregate(AggregateObject &aggr, DataChunk &payload, idx_t payload_idx);
 	bool TryGPUUpdateSumDoubleAggregate(AggregateObject &aggr, DataChunk &payload, idx_t payload_idx);
 	bool TryGPUUpdateDoubleStatsAggregate(AggregateObject &aggr, DataChunk &payload, idx_t payload_idx);
