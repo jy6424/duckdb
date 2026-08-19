@@ -158,12 +158,19 @@ struct UnixFileHandle : public FileHandle {
 public:
 	UnixFileHandle(FileSystem &file_system, string path, int fd, FileOpenFlags flags)
 	    : FileHandle(file_system, std::move(path), flags), fd(fd) {
+		struct stat status;
+		if (fstat(fd, &status) == 0) {
+			device_id = status.st_dev;
+			inode = status.st_ino;
+		}
 	}
 	~UnixFileHandle() override {
 		UnixFileHandle::Close();
 	}
 
 	int fd;
+	dev_t device_id = 0;
+	ino_t inode = 0;
 
 	// Kept for logging purposes
 	idx_t current_pos = 0;
@@ -512,14 +519,14 @@ public:
 	}
 
 	bool Read(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position, int64_t &bytes_read,
-	          int &error_number) {
+	          int &error_number, dev_t device_id, ino_t inode) {
 		if (!Available()) {
 			return false;
 		}
 		if (!use_file_position && ReadAheadEnabled()) {
-			return ReadWithReadAhead(fd, buffer, nr_bytes, location, bytes_read, error_number);
+			return ReadWithReadAhead(fd, buffer, nr_bytes, location, bytes_read, error_number, device_id, inode);
 		}
-		return ReadSync(fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number);
+		return ReadSync(fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number, device_id, inode);
 	}
 
 private:
@@ -528,6 +535,8 @@ private:
 		bool complete = false;
 		bool direct = false;
 		int fd = -1;
+		dev_t device_id = 0;
+		ino_t inode = 0;
 		int result = 0;
 		int64_t location = 0;
 		size_t size = 0;
@@ -538,16 +547,17 @@ private:
 	};
 
 	bool ReadSync(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position,
-	              int64_t &bytes_read, int &error_number) {
-		auto slot_idx = SubmitRequest(fd, buffer, nr_bytes, location, use_file_position, true);
+	              int64_t &bytes_read, int &error_number, dev_t device_id, ino_t inode) {
+		auto slot_idx = SubmitRequest(fd, buffer, nr_bytes, location, use_file_position, true, device_id, inode);
 		if (slot_idx < 0) {
 			error_number = errno;
 			return false;
 		}
 		auto result = WaitForSlot(UnsafeNumericCast<idx_t>(slot_idx), error_number);
-		auto &slot = slots[UnsafeNumericCast<idx_t>(slot_idx)];
-		slot.active = false;
 		if (result < 0) {
+			if (UnsafeNumericCast<idx_t>(slot_idx) < slots.size()) {
+				slots[UnsafeNumericCast<idx_t>(slot_idx)].active = false;
+			}
 			error_number = -result;
 			if (error_number == EINVAL || error_number == ESPIPE || error_number == EOPNOTSUPP ||
 			    error_number == EPERM) {
@@ -557,12 +567,16 @@ private:
 			bytes_read = -1;
 			return true;
 		}
+		if (UnsafeNumericCast<idx_t>(slot_idx) < slots.size()) {
+			slots[UnsafeNumericCast<idx_t>(slot_idx)].active = false;
+		}
 		bytes_read = result;
 		error_number = 0;
 		return true;
 	}
 
-	int SubmitRequest(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position, bool direct) {
+	int SubmitRequest(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position, bool direct,
+	                  dev_t device_id, ino_t inode) {
 		auto slot_idx = FindFreeSlot();
 		if (slot_idx < 0) {
 			DrainCompletions();
@@ -581,6 +595,8 @@ private:
 		slot.complete = false;
 		slot.direct = direct;
 		slot.fd = fd;
+		slot.device_id = device_id;
+		slot.inode = inode;
 		slot.result = 0;
 		slot.location = location;
 		slot.size = nr_bytes;
@@ -635,19 +651,19 @@ private:
 				error_number = errno;
 				Close();
 				disabled = true;
-				return -errno;
+				return -error_number;
 			}
 		}
 	}
 
 	bool ReadWithReadAhead(int fd, void *buffer, size_t nr_bytes, int64_t location, int64_t &bytes_read,
-	                       int &error_number) {
+	                       int &error_number, dev_t device_id, ino_t inode) {
 		DrainCompletions();
-		PruneReadAheadBefore(location);
-		auto cache_bytes = TryConsumeReadAhead(fd, buffer, nr_bytes, location, error_number);
+		PruneReadAheadBefore(fd, device_id, inode, location);
+		auto cache_bytes = TryConsumeReadAhead(fd, buffer, nr_bytes, location, error_number, device_id, inode);
 		if (cache_bytes > 0) {
 			bytes_read = UnsafeNumericCast<int64_t>(cache_bytes);
-			ScheduleReadAhead(fd, location + bytes_read);
+			ScheduleReadAhead(fd, location + bytes_read, device_id, inode);
 			return true;
 		}
 		if (error_number != 0) {
@@ -655,30 +671,37 @@ private:
 			return true;
 		}
 
-		if (!ReadSync(fd, buffer, nr_bytes, location, false, bytes_read, error_number)) {
+		if (!ReadSync(fd, buffer, nr_bytes, location, false, bytes_read, error_number, device_id, inode)) {
 			return false;
 		}
 		if (bytes_read > 0) {
-			ScheduleReadAhead(fd, location + bytes_read);
+			ScheduleReadAhead(fd, location + bytes_read, device_id, inode);
 		}
 		return true;
 	}
 
-	size_t TryConsumeReadAhead(int fd, void *buffer, size_t nr_bytes, int64_t location, int &error_number) {
+	size_t TryConsumeReadAhead(int fd, void *buffer, size_t nr_bytes, int64_t location, int &error_number,
+	                           dev_t device_id, ino_t inode) {
 		idx_t slot_idx;
-		if (!FindReadAheadSlot(fd, location, slot_idx)) {
+		if (!FindReadAheadSlot(fd, device_id, inode, location, slot_idx)) {
 			error_number = 0;
 			return 0;
 		}
-		auto &slot = slots[slot_idx];
-		if (!slot.complete) {
+		if (!slots[slot_idx].complete) {
 			auto result = WaitForSlot(slot_idx, error_number);
 			if (result < 0) {
 				error_number = -result;
-				slot.active = false;
+				if (slot_idx < slots.size()) {
+					slots[slot_idx].active = false;
+				}
 				return 0;
 			}
 		}
+		if (slot_idx >= slots.size()) {
+			error_number = EIO;
+			return 0;
+		}
+		auto &slot = slots[slot_idx];
 		if (slot.result <= 0) {
 			error_number = slot.result < 0 ? -slot.result : 0;
 			slot.active = false;
@@ -700,10 +723,11 @@ private:
 		return copy_bytes;
 	}
 
-	bool FindReadAheadSlot(int fd, int64_t location, idx_t &slot_idx) {
+	bool FindReadAheadSlot(int fd, dev_t device_id, ino_t inode, int64_t location, idx_t &slot_idx) {
 		for (idx_t idx = 0; idx < slots.size(); idx++) {
 			auto &slot = slots[idx];
-			if (!slot.active || slot.direct || slot.fd != fd || location < slot.location) {
+			if (!slot.active || slot.direct || slot.fd != fd || slot.device_id != device_id || slot.inode != inode ||
+			    location < slot.location) {
 				continue;
 			}
 			if (location < slot.location + UnsafeNumericCast<int64_t>(slot.size)) {
@@ -714,7 +738,7 @@ private:
 		return false;
 	}
 
-	void ScheduleReadAhead(int fd, int64_t location) {
+	void ScheduleReadAhead(int fd, int64_t location, dev_t device_id, ino_t inode) {
 		if (location < 0) {
 			return;
 		}
@@ -723,10 +747,10 @@ private:
 			return;
 		}
 		auto max_depth = std::min<idx_t>(ReadAheadDepth(), slots.size() > 1 ? slots.size() - 1 : 0);
-		auto pending = ActiveReadAheadCount(fd);
-		auto next_location = std::max<int64_t>(location, MaxReadAheadEnd(fd));
+		auto pending = ActiveReadAheadCount(fd, device_id, inode);
+		auto next_location = std::max<int64_t>(location, MaxReadAheadEnd(fd, device_id, inode));
 		while (pending < max_depth) {
-			if (SubmitRequest(fd, nullptr, read_ahead_bytes, next_location, false, false) < 0) {
+			if (SubmitRequest(fd, nullptr, read_ahead_bytes, next_location, false, false, device_id, inode) < 0) {
 				break;
 			}
 			next_location += UnsafeNumericCast<int64_t>(read_ahead_bytes);
@@ -734,20 +758,20 @@ private:
 		}
 	}
 
-	idx_t ActiveReadAheadCount(int fd) {
+	idx_t ActiveReadAheadCount(int fd, dev_t device_id, ino_t inode) {
 		idx_t count = 0;
 		for (auto &slot : slots) {
-			if (slot.active && !slot.direct && slot.fd == fd) {
+			if (slot.active && !slot.direct && slot.fd == fd && slot.device_id == device_id && slot.inode == inode) {
 				count++;
 			}
 		}
 		return count;
 	}
 
-	int64_t MaxReadAheadEnd(int fd) {
+	int64_t MaxReadAheadEnd(int fd, dev_t device_id, ino_t inode) {
 		int64_t result = 0;
 		for (auto &slot : slots) {
-			if (!slot.active || slot.direct || slot.fd != fd) {
+			if (!slot.active || slot.direct || slot.fd != fd || slot.device_id != device_id || slot.inode != inode) {
 				continue;
 			}
 			result = std::max<int64_t>(result, slot.location + UnsafeNumericCast<int64_t>(slot.size));
@@ -755,9 +779,12 @@ private:
 		return result;
 	}
 
-	void PruneReadAheadBefore(int64_t location) {
+	void PruneReadAheadBefore(int fd, dev_t device_id, ino_t inode, int64_t location) {
 		for (auto &slot : slots) {
 			if (!slot.active || slot.direct || !slot.complete) {
+				continue;
+			}
+			if (slot.fd != fd || slot.device_id != device_id || slot.inode != inode) {
 				continue;
 			}
 			if (slot.result <= 0 || slot.location + UnsafeNumericCast<int64_t>(slot.result_size) <= location) {
@@ -952,25 +979,27 @@ static bool LocalIoUringEnabled() {
 	return enabled;
 }
 
-static bool TryLocalIoUringRead(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position,
-                                int64_t &bytes_read, int &error_number) {
+static bool TryLocalIoUringRead(UnixFileHandle &unix_handle, void *buffer, size_t nr_bytes, int64_t location,
+                                bool use_file_position, int64_t &bytes_read, int &error_number) {
 	if (!LocalIoUringEnabled() || nr_bytes > NumericLimits<uint32_t>::Maximum()) {
 		return false;
 	}
 	thread_local LocalIoUringReader reader;
-	return reader.Read(fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number);
+	return reader.Read(unix_handle.fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number,
+	                   unix_handle.device_id, unix_handle.inode);
 }
 #endif
 
 void LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
 	auto bytes_to_read = nr_bytes;
-	int fd = handle.Cast<UnixFileHandle>().fd;
+	auto &unix_handle = handle.Cast<UnixFileHandle>();
+	int fd = unix_handle.fd;
 	auto read_buffer = char_ptr_cast(buffer);
 	while (nr_bytes > 0) {
 		int64_t bytes_read;
 #if defined(DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
 		int io_uring_error = 0;
-		if (TryLocalIoUringRead(fd, read_buffer, UnsafeNumericCast<size_t>(nr_bytes),
+		if (TryLocalIoUringRead(unix_handle, read_buffer, UnsafeNumericCast<size_t>(nr_bytes),
 		                        UnsafeNumericCast<int64_t>(location), false, bytes_read, io_uring_error)) {
 			if (bytes_read == -1) {
 				throw IOException({{"errno", std::to_string(io_uring_error)}},
@@ -1005,7 +1034,8 @@ int64_t LocalFileSystem::Read(FileHandle &handle, void *buffer, int64_t nr_bytes
 	int64_t bytes_read;
 #if defined(DUCKDB_LOCAL_FILESYSTEM_HAS_IO_URING) && defined(SYS_io_uring_setup) && defined(SYS_io_uring_enter)
 	int io_uring_error = 0;
-	if (TryLocalIoUringRead(fd, buffer, UnsafeNumericCast<size_t>(nr_bytes), 0, true, bytes_read, io_uring_error)) {
+	if (TryLocalIoUringRead(unix_handle, buffer, UnsafeNumericCast<size_t>(nr_bytes), 0, true, bytes_read,
+	                        io_uring_error)) {
 		if (bytes_read == -1) {
 			throw IOException({{"errno", std::to_string(io_uring_error)}}, "Could not read from file \"%s\": %s",
 			                  handle.path, strerror(io_uring_error));
