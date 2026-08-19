@@ -8,7 +8,14 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <list>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
 #include "thrift/protocol/TCompactProtocol.h"
 #include "thrift/transport/TBufferTransports.h"
 
@@ -30,6 +37,8 @@ struct ReadHead {
 	BufferHandle buffer_handle;
 	data_ptr_t buffer_ptr;
 	bool data_isset = false;
+	bool read_complete = false;
+	std::exception_ptr read_error;
 
 	idx_t GetEnd() const {
 		return size + location;
@@ -57,6 +66,10 @@ struct ReadHeadComparator {
 // 2: prefetch all registered ranges
 struct ReadAheadBuffer {
 	explicit ReadAheadBuffer(CachingFileHandle &file_handle_p) : file_handle(file_handle_p) {
+	}
+
+	~ReadAheadBuffer() {
+		WaitForPrefetch();
 	}
 
 	// The list of read heads
@@ -112,15 +125,95 @@ struct ReadAheadBuffer {
 
 	// Prefetch all read heads
 	void Prefetch() {
-		for (auto &read_head : read_heads) {
-			if (read_head.GetEnd() > file_handle.GetFileSize()) {
-				throw std::runtime_error("Prefetch registered requested for bytes outside file");
+		WaitForPrefetch();
+		{
+			std::lock_guard<std::mutex> guard(prefetch_lock);
+			for (auto &read_head : read_heads) {
+				ValidateReadHead(read_head);
+				read_head.read_complete = false;
+				read_head.read_error = std::exception_ptr();
+				read_head.data_isset = false;
 			}
-			read_head.buffer_handle = file_handle.Read(read_head.buffer_ptr, read_head.size, read_head.location);
-			D_ASSERT(read_head.buffer_handle.IsValid());
-			read_head.data_isset = true;
+		}
+		if (AsyncPrefetchEnabled() && read_heads.size() > 1) {
+			prefetch_thread = std::thread([this]() { PrefetchWorker(); });
+			return;
+		}
+		for (auto &read_head : read_heads) {
+			ReadInto(read_head);
 		}
 	}
+
+	void WaitForReadHead(ReadHead &read_head) {
+		if (!prefetch_thread.joinable() && !read_head.read_complete) {
+			ReadInto(read_head);
+			return;
+		}
+		{
+			std::unique_lock<std::mutex> guard(prefetch_lock);
+			prefetch_cv.wait(guard, [&]() { return read_head.read_complete; });
+		}
+		if (read_head.read_error) {
+			std::rethrow_exception(read_head.read_error);
+		}
+	}
+
+	void Clear() {
+		WaitForPrefetch();
+		read_heads.clear();
+		merge_set.clear();
+		total_size = 0;
+	}
+
+private:
+	static bool AsyncPrefetchEnabled() {
+		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_PREFETCH");
+		if (!value || !value[0]) {
+			return false;
+		}
+		return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+		       strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+		       strcmp(value, "ON") == 0;
+	}
+
+	void ValidateReadHead(ReadHead &read_head) {
+		if (read_head.GetEnd() > file_handle.GetFileSize()) {
+			throw std::runtime_error("Prefetch registered requested for bytes outside file");
+		}
+	}
+
+	void ReadInto(ReadHead &read_head) {
+		try {
+			read_head.buffer_handle = file_handle.Read(read_head.buffer_ptr, read_head.size, read_head.location);
+			D_ASSERT(read_head.buffer_handle.IsValid());
+			{
+				std::lock_guard<std::mutex> guard(prefetch_lock);
+				read_head.data_isset = true;
+				read_head.read_complete = true;
+			}
+		} catch (...) {
+			std::lock_guard<std::mutex> guard(prefetch_lock);
+			read_head.read_error = std::current_exception();
+			read_head.read_complete = true;
+		}
+		prefetch_cv.notify_all();
+	}
+
+	void PrefetchWorker() {
+		for (auto &read_head : read_heads) {
+			ReadInto(read_head);
+		}
+	}
+
+	void WaitForPrefetch() {
+		if (prefetch_thread.joinable()) {
+			prefetch_thread.join();
+		}
+	}
+
+	std::mutex prefetch_lock;
+	std::condition_variable prefetch_cv;
+	std::thread prefetch_thread;
 };
 
 class ThriftFileTransport : public duckdb_apache::thrift::transport::TVirtualTransport<ThriftFileTransport> {
@@ -129,7 +222,7 @@ public:
 
 	ThriftFileTransport(CachingFileHandle &file_handle_p, bool prefetch_mode_p)
 	    : file_handle(file_handle_p), location(0), size(file_handle.GetFileSize()),
-	      ra_buffer(ReadAheadBuffer(file_handle)), prefetch_mode(prefetch_mode_p) {
+	      ra_buffer(file_handle), prefetch_mode(prefetch_mode_p) {
 	}
 
 	uint32_t read(uint8_t *buf, uint32_t len) {
@@ -137,18 +230,14 @@ public:
 		if (prefetch_buffer != nullptr && location - prefetch_buffer->location + len <= prefetch_buffer->size) {
 			D_ASSERT(location - prefetch_buffer->location + len <= prefetch_buffer->size);
 
-			if (!prefetch_buffer->data_isset) {
-				prefetch_buffer->buffer_handle =
-				    file_handle.Read(prefetch_buffer->buffer_ptr, prefetch_buffer->size, prefetch_buffer->location);
-				D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
-				prefetch_buffer->data_isset = true;
-			}
+			ra_buffer.WaitForReadHead(*prefetch_buffer);
 			D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
 			memcpy(buf, prefetch_buffer->buffer_ptr + location - prefetch_buffer->location, len);
 		} else if (prefetch_mode && len < PREFETCH_FALLBACK_BUFFERSIZE && len > 0) {
 			Prefetch(location, MinValue<uint64_t>(PREFETCH_FALLBACK_BUFFERSIZE, file_handle.GetFileSize() - location));
 			auto prefetch_buffer_fallback = ra_buffer.GetReadHead(location);
 			D_ASSERT(location - prefetch_buffer_fallback->location + len <= prefetch_buffer_fallback->size);
+			ra_buffer.WaitForReadHead(*prefetch_buffer_fallback);
 			memcpy(buf, prefetch_buffer_fallback->buffer_ptr + location - prefetch_buffer_fallback->location, len);
 		} else {
 			// No prefetch, do a regular (non-caching) read
@@ -182,8 +271,7 @@ public:
 	}
 
 	void ClearPrefetch() {
-		ra_buffer.read_heads.clear();
-		ra_buffer.merge_set.clear();
+		ra_buffer.Clear();
 	}
 
 	void Skip(idx_t skip_count) {
