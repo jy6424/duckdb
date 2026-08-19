@@ -14,9 +14,11 @@
 #include "duckdb/common/multi_file/multi_file_list.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <vector>
 #include <sys/stat.h>
 
 #ifndef _WIN32
@@ -514,76 +516,351 @@ public:
 		if (!Available()) {
 			return false;
 		}
+		if (!use_file_position && ReadAheadEnabled()) {
+			return ReadWithReadAhead(fd, buffer, nr_bytes, location, bytes_read, error_number);
+		}
+		return ReadSync(fd, buffer, nr_bytes, location, use_file_position, bytes_read, error_number);
+	}
+
+private:
+	struct RequestSlot {
+		bool active = false;
+		bool complete = false;
+		bool direct = false;
+		int fd = -1;
+		int result = 0;
+		int64_t location = 0;
+		size_t size = 0;
+		size_t result_size = 0;
+		void *target = nullptr;
+		vector<char> storage;
+		struct iovec iov;
+	};
+
+	bool ReadSync(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position,
+	              int64_t &bytes_read, int &error_number) {
+		auto slot_idx = SubmitRequest(fd, buffer, nr_bytes, location, use_file_position, true);
+		if (slot_idx < 0) {
+			error_number = errno;
+			return false;
+		}
+		auto result = WaitForSlot(UnsafeNumericCast<idx_t>(slot_idx), error_number);
+		auto &slot = slots[UnsafeNumericCast<idx_t>(slot_idx)];
+		slot.active = false;
+		if (result < 0) {
+			error_number = -result;
+			if (error_number == EINVAL || error_number == ESPIPE || error_number == EOPNOTSUPP ||
+			    error_number == EPERM) {
+				bytes_read = 0;
+				return false;
+			}
+			bytes_read = -1;
+			return true;
+		}
+		bytes_read = result;
+		error_number = 0;
+		return true;
+	}
+
+	int SubmitRequest(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position, bool direct) {
+		auto slot_idx = FindFreeSlot();
+		if (slot_idx < 0) {
+			DrainCompletions();
+			slot_idx = FindFreeSlot();
+		}
+		if (slot_idx < 0) {
+			EvictOneReadAhead();
+			slot_idx = FindFreeSlot();
+		}
+		if (slot_idx < 0) {
+			return -1;
+		}
+
+		auto &slot = slots[UnsafeNumericCast<idx_t>(slot_idx)];
+		slot.active = true;
+		slot.complete = false;
+		slot.direct = direct;
+		slot.fd = fd;
+		slot.result = 0;
+		slot.location = location;
+		slot.size = nr_bytes;
+		slot.result_size = 0;
+		if (direct) {
+			slot.target = buffer;
+		} else {
+			slot.storage.resize(nr_bytes);
+			slot.target = slot.storage.data();
+		}
 
 		auto tail = *sq_tail;
 		auto index = tail & *sq_ring_mask;
 		auto &sqe = sqes[index];
-		struct iovec iov;
 		memset(&sqe, 0, sizeof(sqe));
 #if defined(IORING_OP_READ)
 		sqe.opcode = IORING_OP_READ;
-		sqe.addr = reinterpret_cast<uint64_t>(buffer);
+		sqe.addr = reinterpret_cast<uint64_t>(slot.target);
 		sqe.len = UnsafeNumericCast<uint32_t>(nr_bytes);
 #else
-		iov.iov_base = buffer;
-		iov.iov_len = nr_bytes;
+		slot.iov.iov_base = slot.target;
+		slot.iov.iov_len = nr_bytes;
 		sqe.opcode = IORING_OP_READV;
-		sqe.addr = reinterpret_cast<uint64_t>(&iov);
+		sqe.addr = reinterpret_cast<uint64_t>(&slot.iov);
 		sqe.len = 1;
 #endif
 		sqe.fd = fd;
 		sqe.off = use_file_position ? static_cast<uint64_t>(-1) : UnsafeNumericCast<uint64_t>(location);
+		sqe.user_data = UnsafeNumericCast<uint64_t>(slot_idx + 1);
 		sq_array[index] = index;
 		std::atomic_thread_fence(std::memory_order_release);
 		*sq_tail = tail + 1;
 
-		auto enter_result = syscall(SYS_io_uring_enter, ring_fd, 1, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+		auto enter_result = syscall(SYS_io_uring_enter, ring_fd, 1, 0, 0, nullptr, 0);
 		if (enter_result < 0) {
-			error_number = errno;
+			slot.active = false;
 			Close();
 			disabled = true;
-			return false;
+			return -1;
 		}
+		return slot_idx;
+	}
 
+	int WaitForSlot(idx_t slot_idx, int &error_number) {
 		while (true) {
-			auto head = *cq_head;
-			std::atomic_thread_fence(std::memory_order_acquire);
-			auto cq_tail_value = *cq_tail;
-			if (head == cq_tail_value) {
-				enter_result = syscall(SYS_io_uring_enter, ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
-				if (enter_result < 0) {
-					error_number = errno;
-					Close();
-					disabled = true;
-					return false;
-				}
-				continue;
+			DrainCompletions();
+			if (slot_idx < slots.size() && slots[slot_idx].active && slots[slot_idx].complete) {
+				return slots[slot_idx].result;
 			}
-
-			auto &cqe = cqes[head & *cq_ring_mask];
-			auto result = cqe.res;
-			*cq_head = head + 1;
-			if (result < 0) {
-				error_number = -result;
-				if (error_number == EINVAL || error_number == ESPIPE || error_number == EOPNOTSUPP ||
-				    error_number == EPERM) {
-					bytes_read = 0;
-					return false;
-				}
-				bytes_read = -1;
-				return true;
+			auto enter_result = syscall(SYS_io_uring_enter, ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr, 0);
+			if (enter_result < 0) {
+				error_number = errno;
+				Close();
+				disabled = true;
+				return -errno;
 			}
-			bytes_read = result;
-			error_number = 0;
-			return true;
 		}
 	}
 
-private:
+	bool ReadWithReadAhead(int fd, void *buffer, size_t nr_bytes, int64_t location, int64_t &bytes_read,
+	                       int &error_number) {
+		DrainCompletions();
+		PruneReadAheadBefore(location);
+		auto cache_bytes = TryConsumeReadAhead(fd, buffer, nr_bytes, location, error_number);
+		if (cache_bytes > 0) {
+			bytes_read = UnsafeNumericCast<int64_t>(cache_bytes);
+			ScheduleReadAhead(fd, location + bytes_read);
+			return true;
+		}
+		if (error_number != 0) {
+			bytes_read = -1;
+			return true;
+		}
+
+		if (!ReadSync(fd, buffer, nr_bytes, location, false, bytes_read, error_number)) {
+			return false;
+		}
+		if (bytes_read > 0) {
+			ScheduleReadAhead(fd, location + bytes_read);
+		}
+		return true;
+	}
+
+	size_t TryConsumeReadAhead(int fd, void *buffer, size_t nr_bytes, int64_t location, int &error_number) {
+		idx_t slot_idx;
+		if (!FindReadAheadSlot(fd, location, slot_idx)) {
+			error_number = 0;
+			return 0;
+		}
+		auto &slot = slots[slot_idx];
+		if (!slot.complete) {
+			auto result = WaitForSlot(slot_idx, error_number);
+			if (result < 0) {
+				error_number = -result;
+				slot.active = false;
+				return 0;
+			}
+		}
+		if (slot.result <= 0) {
+			error_number = slot.result < 0 ? -slot.result : 0;
+			slot.active = false;
+			return 0;
+		}
+		auto offset = UnsafeNumericCast<size_t>(location - slot.location);
+		if (offset >= slot.result_size) {
+			error_number = 0;
+			slot.active = false;
+			return 0;
+		}
+		auto available = slot.result_size - offset;
+		auto copy_bytes = std::min(nr_bytes, available);
+		memcpy(buffer, slot.storage.data() + offset, copy_bytes);
+		if (offset + copy_bytes >= slot.result_size) {
+			slot.active = false;
+		}
+		error_number = 0;
+		return copy_bytes;
+	}
+
+	bool FindReadAheadSlot(int fd, int64_t location, idx_t &slot_idx) {
+		for (idx_t idx = 0; idx < slots.size(); idx++) {
+			auto &slot = slots[idx];
+			if (!slot.active || slot.direct || slot.fd != fd || location < slot.location) {
+				continue;
+			}
+			if (location < slot.location + UnsafeNumericCast<int64_t>(slot.size)) {
+				slot_idx = idx;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void ScheduleReadAhead(int fd, int64_t location) {
+		if (location < 0) {
+			return;
+		}
+		auto read_ahead_bytes = ReadAheadBytes();
+		if (read_ahead_bytes == 0) {
+			return;
+		}
+		auto max_depth = std::min<idx_t>(ReadAheadDepth(), slots.size() > 1 ? slots.size() - 1 : 0);
+		auto pending = ActiveReadAheadCount(fd);
+		auto next_location = std::max<int64_t>(location, MaxReadAheadEnd(fd));
+		while (pending < max_depth) {
+			if (SubmitRequest(fd, nullptr, read_ahead_bytes, next_location, false, false) < 0) {
+				break;
+			}
+			next_location += UnsafeNumericCast<int64_t>(read_ahead_bytes);
+			pending++;
+		}
+	}
+
+	idx_t ActiveReadAheadCount(int fd) {
+		idx_t count = 0;
+		for (auto &slot : slots) {
+			if (slot.active && !slot.direct && slot.fd == fd) {
+				count++;
+			}
+		}
+		return count;
+	}
+
+	int64_t MaxReadAheadEnd(int fd) {
+		int64_t result = 0;
+		for (auto &slot : slots) {
+			if (!slot.active || slot.direct || slot.fd != fd) {
+				continue;
+			}
+			result = std::max<int64_t>(result, slot.location + UnsafeNumericCast<int64_t>(slot.size));
+		}
+		return result;
+	}
+
+	void PruneReadAheadBefore(int64_t location) {
+		for (auto &slot : slots) {
+			if (!slot.active || slot.direct || !slot.complete) {
+				continue;
+			}
+			if (slot.result <= 0 || slot.location + UnsafeNumericCast<int64_t>(slot.result_size) <= location) {
+				slot.active = false;
+			}
+		}
+	}
+
+	int FindFreeSlot() {
+		for (idx_t idx = 0; idx < slots.size(); idx++) {
+			if (!slots[idx].active) {
+				return UnsafeNumericCast<int>(idx);
+			}
+		}
+		return -1;
+	}
+
+	void EvictOneReadAhead() {
+		for (auto &slot : slots) {
+			if (slot.active && !slot.direct && slot.complete) {
+				slot.active = false;
+				return;
+			}
+		}
+		for (idx_t idx = 0; idx < slots.size(); idx++) {
+			auto &slot = slots[idx];
+			if (slot.active && !slot.direct) {
+				int error_number = 0;
+				(void)WaitForSlot(idx, error_number);
+				slot.active = false;
+				return;
+			}
+		}
+	}
+
+	void DrainCompletions() {
+		auto head = *cq_head;
+		std::atomic_thread_fence(std::memory_order_acquire);
+		auto cq_tail_value = *cq_tail;
+		while (head != cq_tail_value) {
+			auto &cqe = cqes[head & *cq_ring_mask];
+			auto user_data = cqe.user_data;
+			if (user_data > 0) {
+				auto slot_idx = UnsafeNumericCast<idx_t>(user_data - 1);
+				if (slot_idx < slots.size() && slots[slot_idx].active) {
+					auto &slot = slots[slot_idx];
+					slot.complete = true;
+					slot.result = cqe.res;
+					slot.result_size = cqe.res > 0 ? UnsafeNumericCast<size_t>(cqe.res) : 0;
+				}
+			}
+			head++;
+		}
+		*cq_head = head;
+	}
+
+	static bool ReadAheadEnabled() {
+		auto value = std::getenv("DUCKDB_LOCAL_IO_URING_READAHEAD");
+		if (!value || !value[0]) {
+			return false;
+		}
+		auto enabled = strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+		               strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+		               strcmp(value, "ON") == 0;
+		if (enabled) {
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING_READAHEAD=1\n");
+			}
+		}
+		return enabled;
+	}
+
+	static size_t ReadAheadBytes() {
+		auto value = std::getenv("DUCKDB_LOCAL_IO_URING_READAHEAD_BYTES");
+		if (!value || !value[0]) {
+			return 4ULL * 1024ULL * 1024ULL;
+		}
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			return 4ULL * 1024ULL * 1024ULL;
+		}
+		return UnsafeNumericCast<size_t>(std::min<uint64_t>(parsed, 64ULL * 1024ULL * 1024ULL));
+	}
+
+	static idx_t ReadAheadDepth() {
+		auto value = std::getenv("DUCKDB_LOCAL_IO_URING_READAHEAD_DEPTH");
+		if (!value || !value[0]) {
+			return 4;
+		}
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			return 4;
+		}
+		return UnsafeNumericCast<idx_t>(std::min<uint64_t>(parsed, 32));
+	}
+
 	bool Init() {
 		struct io_uring_params params;
 		memset(&params, 0, sizeof(params));
-		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 8, &params));
+		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 32, &params));
 		if (ring_fd < 0) {
 			disabled = true;
 			return false;
@@ -612,6 +889,7 @@ private:
 		cq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.tail);
 		cq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.ring_mask);
 		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
+		slots.resize(params.sq_entries);
 		initialized = true;
 		return true;
 	}
@@ -633,6 +911,7 @@ private:
 		sq_ring = nullptr;
 		cq_ring = nullptr;
 		sqes = nullptr;
+		slots.clear();
 		initialized = false;
 	}
 
@@ -653,6 +932,7 @@ private:
 	uint32_t *cq_head = nullptr;
 	uint32_t *cq_tail = nullptr;
 	uint32_t *cq_ring_mask = nullptr;
+	vector<RequestSlot> slots;
 };
 
 static bool LocalIoUringEnabled() {
