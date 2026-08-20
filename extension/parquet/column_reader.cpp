@@ -244,6 +244,8 @@ void ColumnReader::RegisterPrefetch(ThriftFileTransport &transport, bool allow_m
 	if (chunk) {
 		uint64_t size = chunk->meta_data.total_compressed_size;
 		transport.RegisterPrefetch(FileOffset(), size, allow_merge);
+		dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+		dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(size, std::memory_order_relaxed);
 	}
 }
 

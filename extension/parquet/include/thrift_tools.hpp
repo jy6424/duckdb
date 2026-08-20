@@ -16,6 +16,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 #include "thrift/protocol/TCompactProtocol.h"
 #include "thrift/transport/TBufferTransports.h"
 
@@ -135,8 +136,13 @@ struct ReadAheadBuffer {
 				read_head.data_isset = false;
 			}
 		}
-		if (AsyncPrefetchEnabled() && (read_heads.size() > 1 || AsyncSinglePrefetchEnabled())) {
-			prefetch_thread = std::thread([this]() { PrefetchWorker(); });
+		if (!read_heads.empty() && AsyncPrefetchEnabled() && (read_heads.size() > 1 || AsyncSinglePrefetchEnabled())) {
+			next_prefetch = read_heads.begin();
+			auto worker_count = MinValue<idx_t>(AsyncPrefetchWorkers(), read_heads.size());
+			prefetch_threads.clear();
+			for (idx_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
+				prefetch_threads.emplace_back([this]() { PrefetchWorker(); });
+			}
 			return;
 		}
 		for (auto &read_head : read_heads) {
@@ -186,6 +192,19 @@ private:
 		       strcmp(value, "ON") == 0;
 	}
 
+	static idx_t AsyncPrefetchWorkers() {
+		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_PREFETCH_WORKERS");
+		if (!value || !value[0]) {
+			return 1;
+		}
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			return 1;
+		}
+		return MinValue<idx_t>(UnsafeNumericCast<idx_t>(parsed), 16);
+	}
+
 	void ValidateReadHead(ReadHead &read_head) {
 		if (read_head.GetEnd() > file_handle.GetFileSize()) {
 			throw std::runtime_error("Prefetch registered requested for bytes outside file");
@@ -210,20 +229,34 @@ private:
 	}
 
 	void PrefetchWorker() {
-		for (auto &read_head : read_heads) {
-			ReadInto(read_head);
+		while (true) {
+			ReadHead *read_head = nullptr;
+			{
+				std::lock_guard<std::mutex> guard(prefetch_worker_lock);
+				if (next_prefetch == read_heads.end()) {
+					return;
+				}
+				read_head = &*next_prefetch;
+				next_prefetch++;
+			}
+			ReadInto(*read_head);
 		}
 	}
 
 	void WaitForPrefetch() {
-		if (prefetch_thread.joinable()) {
-			prefetch_thread.join();
+		for (auto &thread : prefetch_threads) {
+			if (thread.joinable()) {
+				thread.join();
+			}
 		}
+		prefetch_threads.clear();
 	}
 
 	std::mutex prefetch_lock;
+	std::mutex prefetch_worker_lock;
 	std::condition_variable prefetch_cv;
-	std::thread prefetch_thread;
+	std::vector<std::thread> prefetch_threads;
+	std::list<ReadHead>::iterator next_prefetch;
 };
 
 class ThriftFileTransport : public duckdb_apache::thrift::transport::TVirtualTransport<ThriftFileTransport> {

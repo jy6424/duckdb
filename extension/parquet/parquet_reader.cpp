@@ -48,12 +48,15 @@ CreateThriftFileProtocol(QueryContext context, CachingFileHandle &file_handle, b
 	return make_uniq<duckdb_apache::thrift::protocol::TCompactProtocolT<ThriftFileTransport>>(std::move(transport));
 }
 
+static bool DBSParquetReaderEnvFlag(const char *name);
+
 static bool ShouldAndCanPrefetch(ClientContext &context, CachingFileHandle &file_handle) {
 	Value disable_prefetch = false;
 	Value prefetch_all_files = false;
 	context.TryGetCurrentSetting("disable_parquet_prefetching", disable_prefetch);
 	context.TryGetCurrentSetting("prefetch_all_parquet_files", prefetch_all_files);
-	bool should_prefetch = !file_handle.OnDiskFile() || prefetch_all_files.GetValue<bool>();
+	bool should_prefetch = !file_handle.OnDiskFile() || prefetch_all_files.GetValue<bool>() ||
+	                       DBSParquetReaderEnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH");
 	bool can_prefetch = file_handle.CanSeek() && !disable_prefetch.GetValue<bool>();
 	return should_prefetch && can_prefetch;
 }
@@ -1465,7 +1468,9 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 				    GetFileName());
 			}
 
-			if (!filters && scan_percentage > ParquetReaderPrefetchConfig::WHOLE_GROUP_PREFETCH_MINIMUM_SCAN) {
+			const bool force_column_chunk_prefetch = DBSParquetReaderEnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH");
+			if (!force_column_chunk_prefetch && !filters &&
+			    scan_percentage > ParquetReaderPrefetchConfig::WHOLE_GROUP_PREFETCH_MINIMUM_SCAN) {
 				// Prefetch the whole row group
 				if (!state.current_group_prefetched) {
 					auto total_compressed_size = GetGroupCompressedSize(state);
