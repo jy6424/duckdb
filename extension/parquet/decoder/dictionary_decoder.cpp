@@ -5,7 +5,19 @@
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/table_filter_state.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace duckdb {
+
+static bool DBSGpuParquetDirectDecodeEnabled() {
+	const auto value = std::getenv("DUCKDB_GPU_PARQUET_DIRECT_DECODE");
+	if (!value || value[0] == '\0') {
+		return false;
+	}
+	return std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 && std::strcmp(value, "FALSE") != 0 &&
+	       std::strcmp(value, "off") != 0 && std::strcmp(value, "OFF") != 0;
+}
 
 DictionaryDecoder::DictionaryDecoder(ColumnReader &reader)
     : reader(reader), offset_buffer(reader.encoding_buffers[0]), valid_sel(STANDARD_VECTOR_SIZE),
@@ -113,7 +125,7 @@ idx_t DictionaryDecoder::Read(uint8_t *defines, idx_t read_count, Vector &result
 #ifdef DEBUG
 	dictionary_selection_vector.Verify(read_count, dictionary_size + can_have_nulls);
 #endif
-	if (result_offset == 0) {
+	if (result_offset == 0 && !DBSGpuParquetDirectDecodeEnabled()) {
 		result.Dictionary(dictionary, dictionary_selection_vector);
 		D_ASSERT(result.GetVectorType() == VectorType::DICTIONARY_VECTOR);
 	} else {
