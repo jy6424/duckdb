@@ -135,7 +135,7 @@ struct ReadAheadBuffer {
 				read_head.data_isset = false;
 			}
 		}
-		if (AsyncPrefetchEnabled() && read_heads.size() > 1) {
+		if (AsyncPrefetchEnabled() && (read_heads.size() > 1 || AsyncSinglePrefetchEnabled())) {
 			prefetch_thread = std::thread([this]() { PrefetchWorker(); });
 			return;
 		}
@@ -168,6 +168,16 @@ struct ReadAheadBuffer {
 private:
 	static bool AsyncPrefetchEnabled() {
 		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_PREFETCH");
+		if (!value || !value[0]) {
+			return false;
+		}
+		return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+		       strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+		       strcmp(value, "ON") == 0;
+	}
+
+	static bool AsyncSinglePrefetchEnabled() {
+		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH");
 		if (!value || !value[0]) {
 			return false;
 		}
