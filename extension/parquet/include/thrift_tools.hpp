@@ -151,7 +151,7 @@ struct ReadAheadBuffer {
 	}
 
 	void WaitForReadHead(ReadHead &read_head) {
-		if (!prefetch_thread.joinable() && !read_head.read_complete) {
+		if (prefetch_threads.empty() && !read_head.read_complete) {
 			ReadInto(read_head);
 			return;
 		}
