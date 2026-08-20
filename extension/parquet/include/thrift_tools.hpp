@@ -164,6 +164,11 @@ struct ReadAheadBuffer {
 		}
 	}
 
+	bool ReadHeadComplete(ReadHead &read_head) {
+		std::lock_guard<std::mutex> guard(prefetch_lock);
+		return read_head.read_complete;
+	}
+
 	void Clear() {
 		WaitForPrefetch();
 		read_heads.clear();
@@ -273,9 +278,13 @@ public:
 		if (prefetch_buffer != nullptr && location - prefetch_buffer->location + len <= prefetch_buffer->size) {
 			D_ASSERT(location - prefetch_buffer->location + len <= prefetch_buffer->size);
 
-			ra_buffer.WaitForReadHead(*prefetch_buffer);
-			D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
-			memcpy(buf, prefetch_buffer->buffer_ptr + location - prefetch_buffer->location, len);
+			if (ShouldBypassPendingPrefetch(len) && !ra_buffer.ReadHeadComplete(*prefetch_buffer)) {
+				file_handle.GetFileHandle().Read(context, buf, len, location);
+			} else {
+				ra_buffer.WaitForReadHead(*prefetch_buffer);
+				D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
+				memcpy(buf, prefetch_buffer->buffer_ptr + location - prefetch_buffer->location, len);
+			}
 		} else if (prefetch_mode && len < PREFETCH_FALLBACK_BUFFERSIZE && len > 0) {
 			Prefetch(location, MinValue<uint64_t>(PREFETCH_FALLBACK_BUFFERSIZE, file_handle.GetFileSize() - location));
 			auto prefetch_buffer_fallback = ra_buffer.GetReadHead(location);
@@ -343,6 +352,33 @@ public:
 
 private:
 	QueryContext context;
+
+	static bool EnvFlag(const char *name) {
+		auto value = std::getenv(name);
+		if (!value || !value[0]) {
+			return false;
+		}
+		return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+		       strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+		       strcmp(value, "ON") == 0;
+	}
+
+	static uint32_t HeaderBypassBytes() {
+		auto value = std::getenv("DUCKDB_PARQUET_PREFETCH_HEADER_BYPASS_BYTES");
+		if (!value || !value[0]) {
+			return 4096;
+		}
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			return 4096;
+		}
+		return UnsafeNumericCast<uint32_t>(MinValue<uint64_t>(parsed, 1ULL << 20));
+	}
+
+	static bool ShouldBypassPendingPrefetch(uint32_t len) {
+		return EnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH") && len <= HeaderBypassBytes();
+	}
 
 	CachingFileHandle &file_handle;
 	idx_t location;
