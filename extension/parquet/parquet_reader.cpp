@@ -27,6 +27,9 @@
 #include "duckdb/common/multi_file/multi_file_reader.hpp"
 #include "duckdb/common/types/geometry_crs.hpp"
 
+#include <cstdlib>
+#include <cstring>
+
 namespace duckdb {
 
 using duckdb_parquet::ColumnChunk;
@@ -53,6 +56,16 @@ static bool ShouldAndCanPrefetch(ClientContext &context, CachingFileHandle &file
 	bool should_prefetch = !file_handle.OnDiskFile() || prefetch_all_files.GetValue<bool>();
 	bool can_prefetch = file_handle.CanSeek() && !disable_prefetch.GetValue<bool>();
 	return should_prefetch && can_prefetch;
+}
+
+static bool DBSParquetReaderEnvFlag(const char *name) {
+	auto value = std::getenv(name);
+	if (!value || !value[0]) {
+		return false;
+	}
+	return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "TRUE") == 0 ||
+	       std::strcmp(value, "yes") == 0 || std::strcmp(value, "YES") == 0 || std::strcmp(value, "on") == 0 ||
+	       std::strcmp(value, "ON") == 0;
 }
 
 static void ParseParquetFooter(data_ptr_t buffer, const string &file_path, idx_t file_size,
@@ -1438,7 +1451,8 @@ AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &
 			           {{"file", file.path}, {"row_group_id", to_string(state.group_idx_list[state.current_group])}});
 		}
 
-		if (state.prefetch_mode && state.offset_in_group != (idx_t)group.num_rows) {
+		if (state.prefetch_mode && state.offset_in_group != (idx_t)group.num_rows &&
+		    !DBSParquetReaderEnvFlag("DUCKDB_PARQUET_PAGE_PREFETCH_ONLY")) {
 			uint64_t total_row_group_span = GetGroupSpan(state);
 
 			double scan_percentage = (double)(to_scan_compressed_bytes) / static_cast<double>(total_row_group_span);
