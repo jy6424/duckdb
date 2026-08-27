@@ -461,6 +461,8 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 	if (trans.HasPrefetch()) {
 		// Already has some data prefetched, let's not mess with it
 		Read(page_hdr);
+	} else if (DBSParquetEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) {
+		Read(page_hdr);
 	} else {
 		// No prefetch yet, prefetch the full header in one go (so thrift won't read byte-by-byte from storage)
 		// 256 bytes should cover almost all headers (unless it's a V2 header with really LONG string statistics)

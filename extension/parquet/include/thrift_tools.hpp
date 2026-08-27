@@ -394,6 +394,8 @@ public:
 				D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
 				memcpy(buf, prefetch_buffer->buffer_ptr + location - prefetch_buffer->location, len);
 			}
+		} else if (ShouldBypassPendingPrefetch(len)) {
+			file_handle.GetFileHandle().Read(context, buf, len, location);
 		} else if (prefetch_mode && len < PREFETCH_FALLBACK_BUFFERSIZE && len > 0) {
 			Prefetch(location, MinValue<uint64_t>(PREFETCH_FALLBACK_BUFFERSIZE, file_handle.GetFileSize() - location));
 			auto prefetch_buffer_fallback = ra_buffer.GetReadHead(location);
@@ -494,7 +496,9 @@ private:
 	}
 
 	static bool ShouldBypassPendingPrefetch(uint32_t len) {
-		return EnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH") && len <= HeaderBypassBytes();
+		return (EnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH") ||
+		        EnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) &&
+		       len <= HeaderBypassBytes();
 	}
 
 	CachingFileHandle &file_handle;

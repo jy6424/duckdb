@@ -546,6 +546,13 @@ private:
 		struct iovec iov;
 	};
 
+	struct FixedFileRegistration {
+		bool registered = false;
+		int fd = -1;
+		dev_t device_id = 0;
+		ino_t inode = 0;
+	};
+
 	bool ReadSync(int fd, void *buffer, size_t nr_bytes, int64_t location, bool use_file_position,
 	              int64_t &bytes_read, int &error_number, dev_t device_id, ino_t inode) {
 		auto slot_idx = SubmitRequest(fd, buffer, nr_bytes, location, use_file_position, true, device_id, inode);
@@ -590,6 +597,16 @@ private:
 			return -1;
 		}
 
+		auto submit_fd = fd;
+		auto use_fixed_file = sq_poll_enabled && sq_poll_needs_fixed_files;
+		if (use_fixed_file) {
+			auto fixed_file_idx = RegisterFixedFile(fd, device_id, inode);
+			if (fixed_file_idx < 0) {
+				return -1;
+			}
+			submit_fd = fixed_file_idx;
+		}
+
 		auto &slot = slots[UnsafeNumericCast<idx_t>(slot_idx)];
 		slot.active = true;
 		slot.complete = false;
@@ -623,7 +640,17 @@ private:
 		sqe.addr = reinterpret_cast<uint64_t>(&slot.iov);
 		sqe.len = 1;
 #endif
-		sqe.fd = fd;
+		sqe.fd = submit_fd;
+		if (use_fixed_file) {
+#if defined(IOSQE_FIXED_FILE)
+			sqe.flags |= IOSQE_FIXED_FILE;
+#else
+			slot.active = false;
+			Close();
+			disabled = true;
+			return -1;
+#endif
+		}
 		sqe.off = use_file_position ? static_cast<uint64_t>(-1) : UnsafeNumericCast<uint64_t>(location);
 		sqe.user_data = UnsafeNumericCast<uint64_t>(slot_idx + 1);
 		sq_array[index] = index;
@@ -835,6 +862,63 @@ private:
 		}
 	}
 
+	void WaitForAllSlots() {
+		for (idx_t idx = 0; idx < slots.size(); idx++) {
+			if (!slots[idx].active) {
+				continue;
+			}
+			int error_number = 0;
+			(void)WaitForSlot(idx, error_number);
+			slots[idx].active = false;
+		}
+	}
+
+	int RegisterFixedFile(int fd, dev_t device_id, ino_t inode) {
+		if (fixed_file.registered && fixed_file.fd == fd && fixed_file.device_id == device_id &&
+		    fixed_file.inode == inode) {
+			return 0;
+		}
+#if defined(SYS_io_uring_register) && defined(IORING_REGISTER_FILES) && defined(IORING_UNREGISTER_FILES)
+		WaitForAllSlots();
+		if (fixed_file.registered) {
+			auto unregister_result = syscall(SYS_io_uring_register, ring_fd, IORING_UNREGISTER_FILES, nullptr, 0);
+			if (unregister_result < 0) {
+				Close();
+				disabled = true;
+				return -1;
+			}
+			fixed_file = FixedFileRegistration();
+		}
+		int registered_fd = fd;
+		auto register_result = syscall(SYS_io_uring_register, ring_fd, IORING_REGISTER_FILES, &registered_fd, 1);
+		if (register_result < 0) {
+			auto register_errno = errno;
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL fixed-file register failed: %s\n",
+				        strerror(register_errno));
+			}
+			Close();
+			disabled = true;
+			return -1;
+		}
+		fixed_file.registered = true;
+		fixed_file.fd = fd;
+		fixed_file.device_id = device_id;
+		fixed_file.inode = inode;
+		return 0;
+#else
+		static std::atomic<bool> printed(false);
+		if (!printed.exchange(true)) {
+			fprintf(stderr,
+			        "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL fixed-file support unavailable in headers\n");
+		}
+		Close();
+		disabled = true;
+		return -1;
+#endif
+	}
+
 	void DrainCompletions() {
 		auto head = *cq_head;
 		std::atomic_thread_fence(std::memory_order_acquire);
@@ -962,24 +1046,18 @@ private:
 			return false;
 		}
 #if defined(IORING_SETUP_SQPOLL)
-#if defined(IORING_FEAT_SQPOLL_NONFIXED)
-		if (use_sq_poll && !(params.features & IORING_FEAT_SQPOLL_NONFIXED)) {
-#else
 		if (use_sq_poll) {
+#if defined(IORING_FEAT_SQPOLL_NONFIXED)
+			sq_poll_needs_fixed_files = !(params.features & IORING_FEAT_SQPOLL_NONFIXED);
+#else
+			sq_poll_needs_fixed_files = true;
 #endif
-			static std::atomic<bool> printed(false);
-			if (!printed.exchange(true)) {
-				fprintf(stderr,
-				        "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL needs fixed-file support on this kernel; falling back\n");
-			}
-			close(ring_fd);
-			ring_fd = -1;
-			memset(&params, 0, sizeof(params));
-			use_sq_poll = false;
-			ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 32, &params));
-			if (ring_fd < 0) {
-				disabled = true;
-				return false;
+			if (sq_poll_needs_fixed_files) {
+				static std::atomic<bool> printed(false);
+				if (!printed.exchange(true)) {
+					fprintf(stderr,
+					        "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL using fixed-file registration\n");
+				}
 			}
 		}
 #endif
@@ -1021,6 +1099,12 @@ private:
 	}
 
 	void Close() {
+		if (fixed_file.registered && ring_fd >= 0) {
+#if defined(SYS_io_uring_register) && defined(IORING_UNREGISTER_FILES)
+			(void)syscall(SYS_io_uring_register, ring_fd, IORING_UNREGISTER_FILES, nullptr, 0);
+#endif
+		}
+		fixed_file = FixedFileRegistration();
 		if (sq_ring && sq_ring != MAP_FAILED) {
 			munmap(sq_ring, sq_ring_size);
 		}
@@ -1060,6 +1144,8 @@ private:
 	uint32_t *cq_tail = nullptr;
 	uint32_t *cq_ring_mask = nullptr;
 	bool sq_poll_enabled = false;
+	bool sq_poll_needs_fixed_files = false;
+	FixedFileRegistration fixed_file;
 	vector<RequestSlot> slots;
 };
 
