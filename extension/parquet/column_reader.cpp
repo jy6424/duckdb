@@ -311,6 +311,41 @@ static void DBSParquetMaybePrefetchPageData(ThriftFileTransport &trans, const Pa
 	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
 }
 
+static void DBSParquetMaybePipelineNextPageRead(ThriftFileTransport &trans) {
+	if (!DBSParquetEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) {
+		return;
+	}
+	if (DBSParquetEnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH")) {
+		return;
+	}
+	auto location = trans.GetLocation();
+	if (location >= trans.GetSize()) {
+		return;
+	}
+	auto existing = trans.GetReadHead(location);
+	if (existing && existing->GetEnd() > location) {
+		return;
+	}
+	if (trans.HasPrefetch()) {
+		if (!trans.TryClearCompletedPrefetch()) {
+			return;
+		}
+	}
+	auto window_bytes = DBSParquetEnvUInt64("DUCKDB_PARQUET_PIPELINED_PAGE_READ_BYTES", 8ULL << 20);
+	auto remaining = static_cast<uint64_t>(trans.GetSize() - location);
+	auto prefetch_bytes = MinValue<uint64_t>(MaxValue<uint64_t>(window_bytes, 4096), remaining);
+	if (prefetch_bytes == 0) {
+		return;
+	}
+
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prefetch_ns);
+	trans.RegisterPrefetch(location, prefetch_bytes, false);
+	trans.FinalizeRegistration();
+	trans.PrefetchRegisteredPipeline();
+	dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
+}
+
 idx_t ColumnReader::GroupRowsAvailable() {
 	return group_rows_available;
 }
@@ -442,6 +477,7 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 
 	if (PageIsFilteredOut(page_hdr)) {
 		// this page has been filtered out so we don't need to read it
+		DBSParquetMaybePipelineNextPageRead(trans);
 		return;
 	}
 	DBSParquetMaybePrefetchPageData(trans, page_hdr);
@@ -468,6 +504,7 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 	default:
 		break; // ignore INDEX page type and any other custom extensions
 	}
+	DBSParquetMaybePipelineNextPageRead(trans);
 	ResetPage();
 }
 
@@ -741,6 +778,10 @@ void ColumnReader::BeginRead(data_ptr_t define_out, data_ptr_t repeat_out) {
 	// we need to reset the location because multiple column readers share the same protocol
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
 	trans.SetLocation(chunk_read_offset);
+	if (DBSParquetEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ") && trans.HasPrefetch() &&
+	    !trans.GetReadHead(chunk_read_offset)) {
+		trans.ClearPrefetch();
+	}
 
 	// Perform any skips that were not applied yet.
 	if (define_out && repeat_out) {

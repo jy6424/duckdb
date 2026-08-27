@@ -630,6 +630,21 @@ private:
 		std::atomic_thread_fence(std::memory_order_release);
 		*sq_tail = tail + 1;
 
+		if (sq_poll_enabled) {
+#if defined(IORING_SQ_NEED_WAKEUP) && defined(IORING_ENTER_SQ_WAKEUP)
+			if (sq_flags && (*sq_flags & IORING_SQ_NEED_WAKEUP)) {
+				auto wake_result = syscall(SYS_io_uring_enter, ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, nullptr, 0);
+				if (wake_result < 0) {
+					slot.active = false;
+					Close();
+					disabled = true;
+					return -1;
+				}
+			}
+			return slot_idx;
+#endif
+		}
+
 		auto enter_result = syscall(SYS_io_uring_enter, ring_fd, 1, 0, 0, nullptr, 0);
 		if (enter_result < 0) {
 			slot.active = false;
@@ -884,14 +899,90 @@ private:
 		return UnsafeNumericCast<idx_t>(std::min<uint64_t>(parsed, 32));
 	}
 
+	static bool SQPollEnabled() {
+		auto value = std::getenv("DUCKDB_LOCAL_IO_URING_SQPOLL");
+		if (!value || !value[0]) {
+			return false;
+		}
+		auto enabled = strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
+		               strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
+		               strcmp(value, "ON") == 0;
+#if !defined(IORING_SETUP_SQPOLL)
+		if (enabled) {
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL requested but unavailable in headers\n");
+			}
+		}
+		return false;
+#else
+		return enabled;
+#endif
+	}
+
+	static uint32_t SQPollIdleMs() {
+		auto value = std::getenv("DUCKDB_LOCAL_IO_URING_SQPOLL_IDLE_MS");
+		if (!value || !value[0]) {
+			return 2000;
+		}
+		char *end = nullptr;
+		auto parsed = std::strtoull(value, &end, 10);
+		if (!end || *end != '\0' || parsed == 0) {
+			return 2000;
+		}
+		return UnsafeNumericCast<uint32_t>(std::min<uint64_t>(parsed, 60000));
+	}
+
 	bool Init() {
 		struct io_uring_params params;
 		memset(&params, 0, sizeof(params));
+		auto use_sq_poll = SQPollEnabled();
+#if defined(IORING_SETUP_SQPOLL)
+		if (use_sq_poll) {
+			params.flags |= IORING_SETUP_SQPOLL;
+			params.sq_thread_idle = SQPollIdleMs();
+		}
+#endif
 		ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 32, &params));
+#if defined(IORING_SETUP_SQPOLL)
+		if (ring_fd < 0 && use_sq_poll) {
+			auto setup_errno = errno;
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL failed: %s; falling back\n",
+				        strerror(setup_errno));
+			}
+			memset(&params, 0, sizeof(params));
+			use_sq_poll = false;
+			ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 32, &params));
+		}
+#endif
 		if (ring_fd < 0) {
 			disabled = true;
 			return false;
 		}
+#if defined(IORING_SETUP_SQPOLL)
+#if defined(IORING_FEAT_SQPOLL_NONFIXED)
+		if (use_sq_poll && !(params.features & IORING_FEAT_SQPOLL_NONFIXED)) {
+#else
+		if (use_sq_poll) {
+#endif
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr,
+				        "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL needs fixed-file support on this kernel; falling back\n");
+			}
+			close(ring_fd);
+			ring_fd = -1;
+			memset(&params, 0, sizeof(params));
+			use_sq_poll = false;
+			ring_fd = static_cast<int>(syscall(SYS_io_uring_setup, 32, &params));
+			if (ring_fd < 0) {
+				disabled = true;
+				return false;
+			}
+		}
+#endif
 
 		sq_ring_size = params.sq_off.array + params.sq_entries * sizeof(uint32_t);
 		cq_ring_size = params.cq_off.cqes + params.cq_entries * sizeof(struct io_uring_cqe);
@@ -910,6 +1001,7 @@ private:
 		sq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.head);
 		sq_tail = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.tail);
 		sq_ring_mask = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.ring_mask);
+		sq_flags = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.flags);
 		sq_array = reinterpret_cast<uint32_t *>(static_cast<char *>(sq_ring) + params.sq_off.array);
 
 		cq_head = reinterpret_cast<uint32_t *>(static_cast<char *>(cq_ring) + params.cq_off.head);
@@ -918,6 +1010,13 @@ private:
 		cqes = reinterpret_cast<struct io_uring_cqe *>(static_cast<char *>(cq_ring) + params.cq_off.cqes);
 		slots.resize(params.sq_entries);
 		initialized = true;
+		sq_poll_enabled = use_sq_poll;
+		if (sq_poll_enabled) {
+			static std::atomic<bool> printed(false);
+			if (!printed.exchange(true)) {
+				fprintf(stderr, "[duckdb local fs] DUCKDB_LOCAL_IO_URING_SQPOLL=1\n");
+			}
+		}
 		return true;
 	}
 
@@ -955,10 +1054,12 @@ private:
 	uint32_t *sq_head = nullptr;
 	uint32_t *sq_tail = nullptr;
 	uint32_t *sq_ring_mask = nullptr;
+	uint32_t *sq_flags = nullptr;
 	uint32_t *sq_array = nullptr;
 	uint32_t *cq_head = nullptr;
 	uint32_t *cq_tail = nullptr;
 	uint32_t *cq_ring_mask = nullptr;
+	bool sq_poll_enabled = false;
 	vector<RequestSlot> slots;
 };
 

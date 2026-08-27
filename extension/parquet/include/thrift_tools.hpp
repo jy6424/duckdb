@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <list>
 #include <mutex>
@@ -39,6 +40,7 @@ struct ReadHead {
 	data_ptr_t buffer_ptr;
 	bool data_isset = false;
 	bool read_complete = false;
+	bool read_scheduled = false;
 	std::exception_ptr read_error;
 
 	idx_t GetEnd() const {
@@ -127,11 +129,65 @@ struct ReadAheadBuffer {
 	// Prefetch all read heads
 	void Prefetch() {
 		WaitForPrefetch();
+		StartPrefetch(false);
+	}
+
+	void PrefetchPipeline() {
+		{
+			std::lock_guard<std::mutex> guard(prefetch_lock);
+			if (!pipeline_started) {
+				pipeline_started = true;
+				pipeline_stop = false;
+				auto worker_count = AsyncPrefetchWorkers();
+				for (idx_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
+					prefetch_threads.emplace_back([this]() { PipelinePrefetchWorker(); });
+				}
+			}
+			for (auto &read_head : read_heads) {
+				if (read_head.read_complete || read_head.read_scheduled) {
+					continue;
+				}
+				ValidateReadHead(read_head);
+				read_head.read_error = std::exception_ptr();
+				read_head.data_isset = false;
+				read_head.read_scheduled = true;
+				pipeline_queue.push_back(&read_head);
+			}
+		}
+		prefetch_cv.notify_all();
+	}
+
+	bool TryClearCompleted() {
+		{
+			std::lock_guard<std::mutex> guard(prefetch_lock);
+			if (!pipeline_queue.empty() || active_pipeline_reads > 0) {
+				return false;
+			}
+			for (auto &read_head : read_heads) {
+				if (!read_head.read_complete) {
+					return false;
+				}
+			}
+		}
+		{
+			std::lock_guard<std::mutex> guard(prefetch_lock);
+			read_heads.clear();
+			merge_set.clear();
+			total_size = 0;
+		}
+		return true;
+	}
+
+	void StartPrefetch(bool non_blocking) {
 		{
 			std::lock_guard<std::mutex> guard(prefetch_lock);
 			for (auto &read_head : read_heads) {
+				if (non_blocking && read_head.read_complete) {
+					continue;
+				}
 				ValidateReadHead(read_head);
 				read_head.read_complete = false;
+				read_head.read_scheduled = false;
 				read_head.read_error = std::exception_ptr();
 				read_head.data_isset = false;
 			}
@@ -139,7 +195,9 @@ struct ReadAheadBuffer {
 		if (!read_heads.empty() && AsyncPrefetchEnabled() && (read_heads.size() > 1 || AsyncSinglePrefetchEnabled())) {
 			next_prefetch = read_heads.begin();
 			auto worker_count = MinValue<idx_t>(AsyncPrefetchWorkers(), read_heads.size());
-			prefetch_threads.clear();
+			if (!non_blocking) {
+				prefetch_threads.clear();
+			}
 			for (idx_t worker_idx = 0; worker_idx < worker_count; worker_idx++) {
 				prefetch_threads.emplace_back([this]() { PrefetchWorker(); });
 			}
@@ -177,8 +235,8 @@ struct ReadAheadBuffer {
 	}
 
 private:
-	static bool AsyncPrefetchEnabled() {
-		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_PREFETCH");
+	static bool ReadAheadEnvFlag(const char *name) {
+		auto value = std::getenv(name);
 		if (!value || !value[0]) {
 			return false;
 		}
@@ -187,14 +245,26 @@ private:
 		       strcmp(value, "ON") == 0;
 	}
 
+	static bool AsyncPrefetchEnabled() {
+		if (ReadAheadEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) {
+			return true;
+		}
+		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_PREFETCH");
+		if (!value || !value[0]) {
+			return false;
+		}
+		return ReadAheadEnvFlag("DUCKDB_PARQUET_ASYNC_PREFETCH");
+	}
+
 	static bool AsyncSinglePrefetchEnabled() {
+		if (ReadAheadEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) {
+			return true;
+		}
 		auto value = std::getenv("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH");
 		if (!value || !value[0]) {
 			return false;
 		}
-		return strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "TRUE") == 0 ||
-		       strcmp(value, "yes") == 0 || strcmp(value, "YES") == 0 || strcmp(value, "on") == 0 ||
-		       strcmp(value, "ON") == 0;
+		return ReadAheadEnvFlag("DUCKDB_PARQUET_ASYNC_SINGLE_PREFETCH");
 	}
 
 	static idx_t AsyncPrefetchWorkers() {
@@ -224,11 +294,13 @@ private:
 				std::lock_guard<std::mutex> guard(prefetch_lock);
 				read_head.data_isset = true;
 				read_head.read_complete = true;
+				read_head.read_scheduled = false;
 			}
 		} catch (...) {
 			std::lock_guard<std::mutex> guard(prefetch_lock);
 			read_head.read_error = std::current_exception();
 			read_head.read_complete = true;
+			read_head.read_scheduled = false;
 		}
 		prefetch_cv.notify_all();
 	}
@@ -248,13 +320,46 @@ private:
 		}
 	}
 
+	void PipelinePrefetchWorker() {
+		while (true) {
+			ReadHead *read_head = nullptr;
+			{
+				std::unique_lock<std::mutex> guard(prefetch_lock);
+				prefetch_cv.wait(guard, [&]() { return pipeline_stop || !pipeline_queue.empty(); });
+				if (pipeline_stop && pipeline_queue.empty()) {
+					return;
+				}
+				read_head = pipeline_queue.front();
+				pipeline_queue.pop_front();
+				active_pipeline_reads++;
+			}
+			ReadInto(*read_head);
+			{
+				std::lock_guard<std::mutex> guard(prefetch_lock);
+				active_pipeline_reads--;
+			}
+			prefetch_cv.notify_all();
+		}
+	}
+
 	void WaitForPrefetch() {
+		if (pipeline_started) {
+			{
+				std::lock_guard<std::mutex> guard(prefetch_lock);
+				pipeline_stop = true;
+			}
+			prefetch_cv.notify_all();
+		}
 		for (auto &thread : prefetch_threads) {
 			if (thread.joinable()) {
 				thread.join();
 			}
 		}
 		prefetch_threads.clear();
+		pipeline_queue.clear();
+		pipeline_started = false;
+		pipeline_stop = false;
+		active_pipeline_reads = 0;
 	}
 
 	std::mutex prefetch_lock;
@@ -262,6 +367,10 @@ private:
 	std::condition_variable prefetch_cv;
 	std::vector<std::thread> prefetch_threads;
 	std::list<ReadHead>::iterator next_prefetch;
+	std::deque<ReadHead *> pipeline_queue;
+	bool pipeline_started = false;
+	bool pipeline_stop = false;
+	idx_t active_pipeline_reads = 0;
 };
 
 class ThriftFileTransport : public duckdb_apache::thrift::transport::TVirtualTransport<ThriftFileTransport> {
@@ -320,6 +429,14 @@ public:
 	// Prefetch all previously registered ranges
 	void PrefetchRegistered() {
 		ra_buffer.Prefetch();
+	}
+
+	void PrefetchRegisteredPipeline() {
+		ra_buffer.PrefetchPipeline();
+	}
+
+	bool TryClearCompletedPrefetch() {
+		return ra_buffer.TryClearCompleted();
 	}
 
 	void ClearPrefetch() {
