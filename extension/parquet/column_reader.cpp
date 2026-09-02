@@ -311,6 +311,40 @@ static void DBSParquetMaybePrefetchPageData(ThriftFileTransport &trans, const Pa
 	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
 }
 
+static bool DBSParquetMaybeQueuePagePayloadRead(ThriftFileTransport &trans, const PageHeader &page_hdr) {
+	if (!DBSParquetEnvFlag("DUCKDB_PARQUET_PAGE_IO_QUEUE")) {
+		return false;
+	}
+	if (page_hdr.compressed_page_size <= 0) {
+		return false;
+	}
+	auto location = trans.GetLocation();
+	if (location >= trans.GetSize()) {
+		return false;
+	}
+	auto page_bytes = static_cast<uint64_t>(page_hdr.compressed_page_size);
+	auto remaining = static_cast<uint64_t>(trans.GetSize() - location);
+	page_bytes = MinValue<uint64_t>(page_bytes, remaining);
+	if (page_bytes == 0) {
+		return false;
+	}
+	auto existing = trans.GetReadHead(location);
+	if (existing && existing->GetEnd() >= location + page_bytes) {
+		return true;
+	}
+	if (trans.HasPrefetch() && !trans.TryClearCompletedPrefetch()) {
+		return false;
+	}
+
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prefetch_ns);
+	trans.RegisterPrefetch(location, page_bytes, false);
+	trans.FinalizeRegistration();
+	trans.PrefetchRegisteredPipeline();
+	dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(page_bytes, std::memory_order_relaxed);
+	return true;
+}
+
 static void DBSParquetMaybePipelineNextPageRead(ThriftFileTransport &trans) {
 	if (!DBSParquetEnvFlag("DUCKDB_PARQUET_PIPELINED_PAGE_READ")) {
 		return;
@@ -482,7 +516,9 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 		DBSParquetMaybePipelineNextPageRead(trans);
 		return;
 	}
-	DBSParquetMaybePrefetchPageData(trans, page_hdr);
+	if (!DBSParquetMaybeQueuePagePayloadRead(trans, page_hdr)) {
+		DBSParquetMaybePrefetchPageData(trans, page_hdr);
+	}
 
 	switch (page_hdr.type) {
 	case PageType::DATA_PAGE_V2:
