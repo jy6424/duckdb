@@ -182,6 +182,8 @@ public:
 public:
 	void InitializeScan(ClientContext &context, ParquetReaderScanState &state, vector<idx_t> groups_to_read) const;
 	AsyncResult Scan(ClientContext &context, ParquetReaderScanState &state, DataChunk &output);
+	AsyncResult ScanDirectDoubles(ClientContext &context, ParquetReaderScanState &state, double **outputs,
+	                              idx_t output_count, idx_t capacity, idx_t &rows_out);
 
 	idx_t NumRows() const;
 	idx_t NumRowGroups() const;

@@ -913,6 +913,51 @@ void ColumnReader::ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t re
 	dbs_parquet_reader_metrics.decode_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, double *result,
+                                        idx_t result_offset) {
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_decode_ns);
+	if (page_is_filtered_out) {
+		throw InvalidInputException("direct double parquet scan does not support filtered-out pages");
+	}
+	if (HasRepeats()) {
+		throw InvalidInputException("direct double parquet scan does not support repeated fields");
+	}
+	const auto all_valid = PrepareRead(read_now, define_out, repeat_out, result_offset);
+	if (!all_valid) {
+		throw InvalidInputException("direct double parquet scan requires all-valid payload values");
+	}
+	if (encoding != ColumnEncoding::PLAIN) {
+		throw InvalidInputException("direct double parquet scan only supports plain encoded pages");
+	}
+
+	auto result_ptr = result + result_offset;
+	switch (Type().id()) {
+	case LogicalTypeId::DOUBLE: {
+		const auto copy_count = read_now * sizeof(double);
+		if (!block->check_available(copy_count)) {
+			throw InvalidInputException("direct double parquet scan read past available page bytes");
+		}
+		memcpy(result_ptr, block->ptr, copy_count);
+		block->unsafe_inc(copy_count);
+		break;
+	}
+	case LogicalTypeId::FLOAT:
+		if (!block->check_available(read_now * sizeof(float))) {
+			throw InvalidInputException("direct double parquet scan read past available page bytes");
+		}
+		for (idx_t row_idx = 0; row_idx < read_now; row_idx++) {
+			result_ptr[row_idx] = static_cast<double>(block->unsafe_read<float>());
+		}
+		break;
+	default:
+		throw InvalidInputException("direct double parquet scan only supports FLOAT and DOUBLE columns");
+	}
+
+	page_rows_available -= read_now;
+	dbs_parquet_reader_metrics.decoded_rows.fetch_add(read_now, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.decode_calls.fetch_add(1, std::memory_order_relaxed);
+}
+
 void ColumnReader::FinishRead(idx_t read_count) {
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
 	chunk_read_offset = trans.GetLocation();
@@ -941,6 +986,22 @@ idx_t ColumnReader::ReadInternal(uint64_t num_values, data_ptr_t define_out, dat
 idx_t ColumnReader::Read(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result) {
 	BeginRead(define_out, repeat_out);
 	return ReadInternal(num_values, define_out, repeat_out, result);
+}
+
+idx_t ColumnReader::ReadPlainDoubles(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out,
+                                     double *result_out) {
+	BeginRead(define_out, repeat_out);
+	idx_t result_offset = 0;
+	auto to_read = num_values;
+	D_ASSERT(to_read <= STANDARD_VECTOR_SIZE);
+	while (to_read > 0) {
+		auto read_now = ReadPageHeaders(to_read);
+		ReadPlainDoublesData(read_now, define_out, repeat_out, result_out, result_offset);
+		result_offset += read_now;
+		to_read -= read_now;
+	}
+	FinishRead(num_values);
+	return num_values;
 }
 
 void ColumnReader::Select(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result_out,

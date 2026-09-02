@@ -77,6 +77,7 @@ public:
 	static void ApplyFilter(Vector &v, const TableFilter &filter, TableFilterState &filter_state, idx_t scan_count,
 	                        SelectionVector &sel, idx_t &approved_tuple_count);
 	virtual void Skip(idx_t num_values);
+	idx_t ReadPlainDoubles(uint64_t num_values, data_ptr_t define_out, data_ptr_t repeat_out, double *result_out);
 
 	const ParquetReader &Reader();
 	const LogicalType &Type() const {
@@ -210,6 +211,8 @@ private:
 	//! Returns whether all values are valid (i.e., not NULL)
 	bool PrepareRead(idx_t read_count, data_ptr_t define_out, data_ptr_t repeat_out, idx_t result_offset);
 	void ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result, idx_t result_offset);
+	void ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, double *result,
+	                          idx_t result_offset);
 
 	template <class VALUE_TYPE, class CONVERSION, bool HAS_DEFINES, bool CHECKED>
 	void PlainTemplatedInternal(ByteBuffer &plain_data, const uint8_t *__restrict defines, const uint64_t num_values,

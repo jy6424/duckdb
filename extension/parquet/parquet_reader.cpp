@@ -1408,6 +1408,131 @@ void ParquetReader::GetPartitionStats(const duckdb_parquet::FileMetaData &metada
 	}
 }
 
+AsyncResult ParquetReader::ScanDirectDoubles(ClientContext &context, ParquetReaderScanState &state, double **outputs,
+                                             idx_t output_count, idx_t capacity, idx_t &rows_out) {
+	rows_out = 0;
+	if (!outputs || output_count != column_ids.size() || capacity == 0 || capacity > STANDARD_VECTOR_SIZE) {
+		throw InvalidInputException("invalid direct double parquet scan output buffers");
+	}
+	if (filters) {
+		throw InvalidInputException("direct double parquet scan does not support table filters");
+	}
+	auto &deletion_filter = state.root_reader->Reader().deletion_filter;
+	if (deletion_filter) {
+		throw InvalidInputException("direct double parquet scan does not support deletion filters");
+	}
+	if (state.finished) {
+		return SourceResultType::FINISHED;
+	}
+
+	while (state.current_group < 0 || (int64_t)state.offset_in_group >= GetGroup(state).num_rows) {
+		state.current_group++;
+		state.offset_in_group = 0;
+
+		auto &trans = reinterpret_cast<ThriftFileTransport &>(*state.thrift_file_proto->getTransport());
+		trans.ClearPrefetch();
+		state.current_group_prefetched = false;
+
+		if ((idx_t)state.current_group == state.group_idx_list.size()) {
+			state.finished = true;
+			return SourceResultType::FINISHED;
+		}
+
+		state.group_offset = GetRowGroupOffset(state.root_reader->Reader(), state.group_idx_list[state.current_group]);
+
+		uint64_t to_scan_compressed_bytes = 0;
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto col_idx = MultiFileLocalIndex(i);
+			PrepareRowGroupBuffer(state, col_idx);
+
+			auto file_col_idx = column_ids[col_idx];
+			auto &root_reader = state.root_reader->Cast<StructColumnReader>();
+			to_scan_compressed_bytes += root_reader.GetChildReader(file_col_idx).TotalCompressedSize();
+		}
+
+		auto &group = GetGroup(state);
+		const bool row_group_pruned = state.offset_in_group == (idx_t)group.num_rows;
+		if (!row_group_pruned) {
+			state.row_groups_scanned++;
+		}
+		if (state.op) {
+			DUCKDB_LOG(context, PhysicalOperatorLogType, *state.op, "ParquetReader",
+			           row_group_pruned ? "SkipRowGroup" : "ReadRowGroup",
+			           {{"file", file.path}, {"row_group_id", to_string(state.group_idx_list[state.current_group])}});
+		}
+
+		if (state.prefetch_mode && state.offset_in_group != (idx_t)group.num_rows &&
+		    !DBSParquetReaderEnvFlag("DUCKDB_PARQUET_PAGE_PREFETCH_ONLY")) {
+			uint64_t total_row_group_span = GetGroupSpan(state);
+			double scan_percentage = (double)(to_scan_compressed_bytes) / static_cast<double>(total_row_group_span);
+			if (to_scan_compressed_bytes > total_row_group_span) {
+				throw IOException(
+				    "The parquet file '%s' seems to have incorrectly set page offsets. This interferes with DuckDB's "
+				    "prefetching optimization. DuckDB may still be able to scan this file by manually disabling the "
+				    "prefetching mechanism using: 'SET disable_parquet_prefetching=true'.",
+				    GetFileName());
+			}
+
+			const bool force_column_chunk_prefetch = DBSParquetReaderEnvFlag("DUCKDB_PARQUET_COLUMN_CHUNK_PREFETCH");
+			if (!force_column_chunk_prefetch &&
+			    scan_percentage > ParquetReaderPrefetchConfig::WHOLE_GROUP_PREFETCH_MINIMUM_SCAN) {
+				if (!state.current_group_prefetched) {
+					auto total_compressed_size = GetGroupCompressedSize(state);
+					if (total_compressed_size > 0) {
+						trans.Prefetch(GetGroupOffset(state), total_row_group_span);
+					}
+					state.current_group_prefetched = true;
+				}
+			} else {
+				auto &root_reader = state.root_reader->Cast<StructColumnReader>();
+				for (idx_t i = 0; i < column_ids.size(); i++) {
+					auto col_idx = MultiFileLocalIndex(i);
+					auto file_col_idx = column_ids[col_idx];
+					root_reader.GetChildReader(file_col_idx).RegisterPrefetch(trans, true);
+				}
+				trans.FinalizeRegistration();
+				trans.PrefetchRegistered();
+			}
+		}
+
+		if (!row_group_pruned) {
+			break;
+		}
+	}
+
+	auto scan_count = MinValue<idx_t>(capacity, GetGroup(state).num_rows - state.offset_in_group);
+	if (scan_count == 0) {
+		state.finished = true;
+		return SourceResultType::FINISHED;
+	}
+
+	state.define_buf.zero();
+	state.repeat_buf.zero();
+	auto define_ptr = (uint8_t *)state.define_buf.ptr;
+	auto repeat_ptr = (uint8_t *)state.repeat_buf.ptr;
+	auto &root_reader = state.root_reader->Cast<StructColumnReader>();
+
+	for (idx_t i = 0; i < column_ids.size(); i++) {
+		auto col_idx = MultiFileLocalIndex(i);
+		auto file_col_idx = column_ids[col_idx];
+		auto &child_reader = root_reader.GetChildReader(file_col_idx);
+		if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_V1) {
+			child_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
+			                                      GetGroup(state).ordinal);
+		}
+		auto rows_read = child_reader.ReadPlainDoubles(scan_count, define_ptr, repeat_ptr, outputs[i]);
+		if (rows_read != scan_count) {
+			throw InvalidInputException("Mismatch in parquet direct double read for column %llu, expected %llu rows, got %llu",
+			                            file_col_idx, scan_count, rows_read);
+		}
+	}
+
+	rows_read += scan_count;
+	state.offset_in_group += scan_count;
+	rows_out = scan_count;
+	return SourceResultType::HAVE_MORE_OUTPUT;
+}
+
 AsyncResult ParquetReader::Scan(ClientContext &context, ParquetReaderScanState &state, DataChunk &result) {
 	result.Reset();
 	if (state.finished) {
