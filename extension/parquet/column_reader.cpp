@@ -81,7 +81,8 @@ struct DBSParquetReaderMetricsState {
 	std::atomic<uint64_t> sink_calls {0};
 };
 
-static DBSParquetReaderMetricsState dbs_parquet_reader_metrics;
+static DBSParquetReaderMetricsState dbs_parquet_reader_default_metrics;
+thread_local DBSParquetReaderMetricsState *dbs_parquet_reader_metrics = &dbs_parquet_reader_default_metrics;
 
 static bool DBSParquetEnvFlag(const char *name) {
 	auto value = std::getenv(name);
@@ -124,73 +125,88 @@ private:
 
 } // namespace
 
+extern "C" void *duckdb_dbs_parquet_reader_metrics_create() {
+	return new DBSParquetReaderMetricsState();
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_destroy(void *metrics) {
+	if (metrics && metrics != &dbs_parquet_reader_default_metrics) {
+		delete reinterpret_cast<DBSParquetReaderMetricsState *>(metrics);
+	}
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_set_current(void *metrics) {
+	dbs_parquet_reader_metrics =
+	    metrics ? reinterpret_cast<DBSParquetReaderMetricsState *>(metrics) : &dbs_parquet_reader_default_metrics;
+}
+
 extern "C" void duckdb_dbs_parquet_reader_metrics_reset() {
-	dbs_parquet_reader_metrics.page_header_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_payload_read_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_decompress_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_decode_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_prepare_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_prefetch_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.pages.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.page_payload_bytes.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.decoded_rows.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.decode_calls.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.prefetch_ranges.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.prefetch_bytes.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.direct_scan_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.row_group_setup_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.column_loop_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.sink_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.scratch_resize_ns.store(0, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.sink_calls.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_header_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_payload_read_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_decompress_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_decode_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_prepare_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_prefetch_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->pages.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_payload_bytes.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decoded_rows.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decode_calls.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_ranges.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_bytes.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->direct_scan_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->row_group_setup_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->column_loop_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->sink_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->scratch_resize_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->sink_calls.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_snapshot(DuckDBDBSParquetReaderMetricsSnapshot *out) {
 	if (!out) {
 		return;
 	}
-	out->page_header_ns = dbs_parquet_reader_metrics.page_header_ns.load(std::memory_order_relaxed);
-	out->page_payload_read_ns = dbs_parquet_reader_metrics.page_payload_read_ns.load(std::memory_order_relaxed);
-	out->page_decompress_ns = dbs_parquet_reader_metrics.page_decompress_ns.load(std::memory_order_relaxed);
-	out->page_decode_ns = dbs_parquet_reader_metrics.page_decode_ns.load(std::memory_order_relaxed);
-	out->page_prepare_ns = dbs_parquet_reader_metrics.page_prepare_ns.load(std::memory_order_relaxed);
-	out->page_prefetch_ns = dbs_parquet_reader_metrics.page_prefetch_ns.load(std::memory_order_relaxed);
-	out->pages = dbs_parquet_reader_metrics.pages.load(std::memory_order_relaxed);
-	out->page_payload_bytes = dbs_parquet_reader_metrics.page_payload_bytes.load(std::memory_order_relaxed);
-	out->decoded_rows = dbs_parquet_reader_metrics.decoded_rows.load(std::memory_order_relaxed);
-	out->decode_calls = dbs_parquet_reader_metrics.decode_calls.load(std::memory_order_relaxed);
-	out->prefetch_ranges = dbs_parquet_reader_metrics.prefetch_ranges.load(std::memory_order_relaxed);
-	out->prefetch_bytes = dbs_parquet_reader_metrics.prefetch_bytes.load(std::memory_order_relaxed);
-	out->direct_scan_ns = dbs_parquet_reader_metrics.direct_scan_ns.load(std::memory_order_relaxed);
-	out->row_group_setup_ns = dbs_parquet_reader_metrics.row_group_setup_ns.load(std::memory_order_relaxed);
-	out->column_loop_ns = dbs_parquet_reader_metrics.column_loop_ns.load(std::memory_order_relaxed);
-	out->sink_ns = dbs_parquet_reader_metrics.sink_ns.load(std::memory_order_relaxed);
-	out->scratch_resize_ns = dbs_parquet_reader_metrics.scratch_resize_ns.load(std::memory_order_relaxed);
-	out->sink_calls = dbs_parquet_reader_metrics.sink_calls.load(std::memory_order_relaxed);
+	out->page_header_ns = dbs_parquet_reader_metrics->page_header_ns.load(std::memory_order_relaxed);
+	out->page_payload_read_ns = dbs_parquet_reader_metrics->page_payload_read_ns.load(std::memory_order_relaxed);
+	out->page_decompress_ns = dbs_parquet_reader_metrics->page_decompress_ns.load(std::memory_order_relaxed);
+	out->page_decode_ns = dbs_parquet_reader_metrics->page_decode_ns.load(std::memory_order_relaxed);
+	out->page_prepare_ns = dbs_parquet_reader_metrics->page_prepare_ns.load(std::memory_order_relaxed);
+	out->page_prefetch_ns = dbs_parquet_reader_metrics->page_prefetch_ns.load(std::memory_order_relaxed);
+	out->pages = dbs_parquet_reader_metrics->pages.load(std::memory_order_relaxed);
+	out->page_payload_bytes = dbs_parquet_reader_metrics->page_payload_bytes.load(std::memory_order_relaxed);
+	out->decoded_rows = dbs_parquet_reader_metrics->decoded_rows.load(std::memory_order_relaxed);
+	out->decode_calls = dbs_parquet_reader_metrics->decode_calls.load(std::memory_order_relaxed);
+	out->prefetch_ranges = dbs_parquet_reader_metrics->prefetch_ranges.load(std::memory_order_relaxed);
+	out->prefetch_bytes = dbs_parquet_reader_metrics->prefetch_bytes.load(std::memory_order_relaxed);
+	out->direct_scan_ns = dbs_parquet_reader_metrics->direct_scan_ns.load(std::memory_order_relaxed);
+	out->row_group_setup_ns = dbs_parquet_reader_metrics->row_group_setup_ns.load(std::memory_order_relaxed);
+	out->column_loop_ns = dbs_parquet_reader_metrics->column_loop_ns.load(std::memory_order_relaxed);
+	out->sink_ns = dbs_parquet_reader_metrics->sink_ns.load(std::memory_order_relaxed);
+	out->scratch_resize_ns = dbs_parquet_reader_metrics->scratch_resize_ns.load(std::memory_order_relaxed);
+	out->sink_calls = dbs_parquet_reader_metrics->sink_calls.load(std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_direct_scan_ns(uint64_t ns) {
-	dbs_parquet_reader_metrics.direct_scan_ns.fetch_add(ns, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->direct_scan_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_row_group_setup_ns(uint64_t ns) {
-	dbs_parquet_reader_metrics.row_group_setup_ns.fetch_add(ns, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->row_group_setup_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_column_loop_ns(uint64_t ns) {
-	dbs_parquet_reader_metrics.column_loop_ns.fetch_add(ns, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->column_loop_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_ns(uint64_t ns) {
-	dbs_parquet_reader_metrics.sink_ns.fetch_add(ns, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->sink_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_scratch_resize_ns(uint64_t ns) {
-	dbs_parquet_reader_metrics.scratch_resize_ns.fetch_add(ns, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->scratch_resize_ns.fetch_add(ns, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_calls(uint64_t count) {
-	dbs_parquet_reader_metrics.sink_calls.fetch_add(count, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->sink_calls.fetch_add(count, std::memory_order_relaxed);
 }
 
 namespace duckdb {
@@ -292,8 +308,8 @@ void ColumnReader::RegisterPrefetch(ThriftFileTransport &transport, bool allow_m
 	if (chunk) {
 		uint64_t size = chunk->meta_data.total_compressed_size;
 		transport.RegisterPrefetch(FileOffset(), size, allow_merge);
-		dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
-		dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(size, std::memory_order_relaxed);
+		dbs_parquet_reader_metrics->prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+		dbs_parquet_reader_metrics->prefetch_bytes.fetch_add(size, std::memory_order_relaxed);
 	}
 }
 
@@ -351,12 +367,12 @@ static void DBSParquetMaybePrefetchPageData(ThriftFileTransport &trans, const Pa
 	auto remaining = static_cast<uint64_t>(trans.GetSize() - location);
 	auto prefetch_bytes = MinValue<uint64_t>(window_bytes, remaining);
 
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prefetch_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_prefetch_ns);
 	trans.RegisterPrefetch(location, prefetch_bytes, false);
 	trans.FinalizeRegistration();
 	trans.PrefetchRegistered();
-	dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
 }
 
 static bool DBSParquetMaybeQueuePagePayloadRead(ThriftFileTransport &trans, const PageHeader &page_hdr) {
@@ -384,12 +400,12 @@ static bool DBSParquetMaybeQueuePagePayloadRead(ThriftFileTransport &trans, cons
 		return false;
 	}
 
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prefetch_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_prefetch_ns);
 	trans.RegisterPrefetch(location, page_bytes, false);
 	trans.FinalizeRegistration();
 	trans.PrefetchRegisteredPipeline();
-	dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(page_bytes, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_bytes.fetch_add(page_bytes, std::memory_order_relaxed);
 	return true;
 }
 
@@ -420,12 +436,12 @@ static void DBSParquetMaybePipelineNextPageRead(ThriftFileTransport &trans) {
 		return;
 	}
 
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prefetch_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_prefetch_ns);
 	trans.RegisterPrefetch(location, prefetch_bytes, false);
 	trans.FinalizeRegistration();
 	trans.PrefetchRegisteredPipeline();
-	dbs_parquet_reader_metrics.prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_ranges.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->prefetch_bytes.fetch_add(prefetch_bytes, std::memory_order_relaxed);
 }
 
 idx_t ColumnReader::GroupRowsAvailable() {
@@ -514,7 +530,7 @@ void ColumnReader::ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buf
 }
 
 void ColumnReader::Read(PageHeader &page_hdr) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_header_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_header_ns);
 	if (reader.parquet_options.encryption_config) {
 		ReadEncrypted(page_hdr);
 	} else {
@@ -523,23 +539,23 @@ void ColumnReader::Read(PageHeader &page_hdr) {
 }
 
 void ColumnReader::ReadData(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type page_type) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_payload_read_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_payload_read_ns);
 	if (reader.parquet_options.encryption_config) {
 		ReadDataEncrypted(buffer, buffer_size, page_type);
 	} else {
 		reader.ReadData(*protocol, buffer, buffer_size);
 	}
-	dbs_parquet_reader_metrics.page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
 void ColumnReader::ReadDataPointer(data_ptr_t &buffer, const uint32_t buffer_size, PageType::type page_type) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_payload_read_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_payload_read_ns);
 	if (reader.parquet_options.encryption_config) {
 		throw InvalidInputException("direct Parquet page buffer does not support encrypted pages");
 	}
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
 	trans.ReadPointer(buffer, buffer_size, direct_block_handle);
-	dbs_parquet_reader_metrics.page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
 void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_ptr<TableFilterState> filter_state) {
@@ -613,7 +629,7 @@ static bool DBSParquetDirectPageBufferEnabled() {
 }
 
 void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prepare_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_prepare_ns);
 	D_ASSERT(page_hdr.type == PageType::DATA_PAGE_V2);
 
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
@@ -698,7 +714,7 @@ void ColumnReader::AllocateBlock(idx_t size) {
 }
 
 void ColumnReader::PreparePage(PageHeader &page_hdr) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prepare_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_prepare_ns);
 	AllocateBlock(page_hdr.uncompressed_page_size + 1);
 	uint32_t compressed_page_size = page_hdr.compressed_page_size;
 
@@ -740,7 +756,7 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 
 void ColumnReader::DecompressInternal(CompressionCodec::type codec, const_data_ptr_t src, idx_t src_size,
                                       data_ptr_t dst, idx_t dst_size) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_decompress_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_decompress_ns);
 	switch (codec) {
 	case CompressionCodec::UNCOMPRESSED:
 		throw InternalException("Parquet data unexpectedly uncompressed");
@@ -815,7 +831,7 @@ void ColumnReader::DecompressInternal(CompressionCodec::type codec, const_data_p
 }
 
 void ColumnReader::PrepareDataPage(PageHeader &page_hdr) {
-	dbs_parquet_reader_metrics.pages.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->pages.fetch_add(1, std::memory_order_relaxed);
 	if (page_hdr.type == PageType::DATA_PAGE && !page_hdr.__isset.data_page_header) {
 		throw InvalidInputException("Failed to read file \"%s\": Missing data page header from data page",
 		                            Reader().GetFileName());
@@ -964,7 +980,7 @@ bool ColumnReader::PrepareDirectDoubleRead(idx_t read_now) {
 
 void ColumnReader::ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
                             idx_t result_offset) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_decode_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_decode_ns);
 	// flatten the result vector if required
 	if (result_offset != 0 && result.GetVectorType() != VectorType::FLAT_VECTOR) {
 		result.Flatten(result_offset);
@@ -1007,13 +1023,13 @@ void ColumnReader::ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t re
 		break;
 	}
 	page_rows_available -= read_now;
-	dbs_parquet_reader_metrics.decoded_rows.fetch_add(read_now, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.decode_calls.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decoded_rows.fetch_add(read_now, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decode_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, double *result,
                                         idx_t result_offset) {
-	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_decode_ns);
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics->page_decode_ns);
 	if (page_is_filtered_out) {
 		throw InvalidInputException("direct double parquet scan does not support filtered-out pages");
 	}
@@ -1057,8 +1073,8 @@ void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, d
 	}
 
 	page_rows_available -= read_now;
-	dbs_parquet_reader_metrics.decoded_rows.fetch_add(read_now, std::memory_order_relaxed);
-	dbs_parquet_reader_metrics.decode_calls.fetch_add(1, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decoded_rows.fetch_add(read_now, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics->decode_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 idx_t ColumnReader::ReadPageHeadersDirectDoubles(idx_t max_read) {
