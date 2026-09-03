@@ -212,9 +212,11 @@ private:
 	//! Prepare a read of up to "max_read" rows and read the defines/repeats.
 	//! Returns whether all values are valid (i.e., not NULL)
 	bool PrepareRead(idx_t read_count, data_ptr_t define_out, data_ptr_t repeat_out, idx_t result_offset);
+	bool PrepareDirectDoubleRead(idx_t read_count);
 	void ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result, idx_t result_offset);
 	void ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, double *result,
 	                          idx_t result_offset);
+	idx_t ReadPageHeadersDirectDoubles(idx_t max_read);
 
 	template <class VALUE_TYPE, class CONVERSION, bool HAS_DEFINES, bool CHECKED>
 	void PlainTemplatedInternal(ByteBuffer &plain_data, const uint8_t *__restrict defines, const uint64_t num_values,

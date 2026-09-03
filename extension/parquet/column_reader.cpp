@@ -897,6 +897,23 @@ bool ColumnReader::PrepareRead(idx_t read_now, data_ptr_t define_out, data_ptr_t
 	return true; // No defines, so everything is valid
 }
 
+bool ColumnReader::PrepareDirectDoubleRead(idx_t read_now) {
+	D_ASSERT(block);
+
+	if (HasRepeats()) {
+		throw InvalidInputException("direct double parquet scan does not support repeated fields");
+	}
+	if (HasDefines()) {
+		D_ASSERT(defined_decoder);
+		const auto max_define = NumericCast<uint8_t>(MaxDefine());
+		if (!defined_decoder->HasRepeatedBatch<uint8_t>(NumericCast<uint32_t>(read_now), max_define)) {
+			return false;
+		}
+		defined_decoder->GetRepeatedBatch<uint8_t>(NumericCast<uint32_t>(read_now), max_define);
+	}
+	return true;
+}
+
 void ColumnReader::ReadData(idx_t read_now, data_ptr_t define_out, data_ptr_t repeat_out, Vector &result,
                             idx_t result_offset) {
 	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_decode_ns);
@@ -955,8 +972,7 @@ void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, d
 	if (HasRepeats()) {
 		throw InvalidInputException("direct double parquet scan does not support repeated fields");
 	}
-	D_ASSERT(read_now <= STANDARD_VECTOR_SIZE);
-	const auto all_valid = PrepareRead(read_now, define_out, repeat_out, 0);
+	const auto all_valid = PrepareDirectDoubleRead(read_now);
 	if (!all_valid) {
 		throw InvalidInputException("direct double parquet scan requires all-valid payload values");
 	}
@@ -997,6 +1013,16 @@ void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, d
 	dbs_parquet_reader_metrics.decode_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+idx_t ColumnReader::ReadPageHeadersDirectDoubles(idx_t max_read) {
+	int8_t page_ordinal = 0;
+	while (page_rows_available == 0) {
+		aad_crypto_metadata.page_ordinal = page_ordinal;
+		PrepareRead(nullptr, nullptr);
+		page_ordinal++;
+	}
+	return MinValue<idx_t>(max_read, page_rows_available);
+}
+
 void ColumnReader::FinishRead(idx_t read_count) {
 	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
 	chunk_read_offset = trans.GetLocation();
@@ -1033,7 +1059,7 @@ idx_t ColumnReader::ReadPlainDoubles(uint64_t num_values, data_ptr_t define_out,
 	idx_t result_offset = 0;
 	auto to_read = num_values;
 	while (to_read > 0) {
-		auto read_now = ReadPageHeaders(to_read);
+		auto read_now = ReadPageHeadersDirectDoubles(to_read);
 		ReadPlainDoublesData(read_now, define_out, repeat_out, result_out, result_offset);
 		result_offset += read_now;
 		to_read -= read_now;
