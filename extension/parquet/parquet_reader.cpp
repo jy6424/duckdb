@@ -28,7 +28,15 @@
 #include "duckdb/common/types/geometry_crs.hpp"
 
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_direct_scan_ns(uint64_t ns);
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_row_group_setup_ns(uint64_t ns);
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_column_loop_ns(uint64_t ns);
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_ns(uint64_t ns);
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_scratch_resize_ns(uint64_t ns);
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_calls(uint64_t count);
 
 namespace duckdb {
 
@@ -49,6 +57,26 @@ CreateThriftFileProtocol(QueryContext context, CachingFileHandle &file_handle, b
 }
 
 static bool DBSParquetReaderEnvFlag(const char *name);
+
+static uint64_t DBSParquetElapsedNs(std::chrono::steady_clock::time_point start) {
+	auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start);
+	return static_cast<uint64_t>(elapsed.count());
+}
+
+class DBSParquetMetricScope {
+public:
+	explicit DBSParquetMetricScope(void (*add_p)(uint64_t))
+	    : add(add_p), start(std::chrono::steady_clock::now()) {
+	}
+
+	~DBSParquetMetricScope() {
+		add(DBSParquetElapsedNs(start));
+	}
+
+private:
+	void (*add)(uint64_t);
+	std::chrono::steady_clock::time_point start;
+};
 
 static bool ShouldAndCanPrefetch(ClientContext &context, CachingFileHandle &file_handle) {
 	Value disable_prefetch = false;
@@ -1410,6 +1438,7 @@ void ParquetReader::GetPartitionStats(const duckdb_parquet::FileMetaData &metada
 
 AsyncResult ParquetReader::ScanDirectDoubles(ClientContext &context, ParquetReaderScanState &state, double **outputs,
                                              idx_t output_count, idx_t capacity, idx_t &rows_out) {
+	DBSParquetMetricScope direct_scan_scope(duckdb_dbs_parquet_reader_metrics_add_direct_scan_ns);
 	rows_out = 0;
 	if (!outputs || output_count != column_ids.size() || capacity == 0) {
 		throw InvalidInputException("invalid direct double parquet scan output buffers");
@@ -1426,6 +1455,7 @@ AsyncResult ParquetReader::ScanDirectDoubles(ClientContext &context, ParquetRead
 	}
 
 	while (state.current_group < 0 || (int64_t)state.offset_in_group >= GetGroup(state).num_rows) {
+		DBSParquetMetricScope row_group_scope(duckdb_dbs_parquet_reader_metrics_add_row_group_setup_ns);
 		state.current_group++;
 		state.offset_in_group = 0;
 
@@ -1512,18 +1542,22 @@ AsyncResult ParquetReader::ScanDirectDoubles(ClientContext &context, ParquetRead
 	auto repeat_ptr = (uint8_t *)state.repeat_buf.ptr;
 	auto &root_reader = state.root_reader->Cast<StructColumnReader>();
 
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		auto col_idx = MultiFileLocalIndex(i);
-		auto file_col_idx = column_ids[col_idx];
-		auto &child_reader = root_reader.GetChildReader(file_col_idx);
-		if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_V1) {
-			child_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
-			                                      GetGroup(state).ordinal);
-		}
-		auto rows_read = child_reader.ReadPlainDoubles(scan_count, define_ptr, repeat_ptr, outputs[i]);
-		if (rows_read != scan_count) {
-			throw InvalidInputException("Mismatch in parquet direct double read for column %llu, expected %llu rows, got %llu",
-			                            file_col_idx, scan_count, rows_read);
+	{
+		DBSParquetMetricScope column_loop_scope(duckdb_dbs_parquet_reader_metrics_add_column_loop_ns);
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto col_idx = MultiFileLocalIndex(i);
+			auto file_col_idx = column_ids[col_idx];
+			auto &child_reader = root_reader.GetChildReader(file_col_idx);
+			if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_V1) {
+				child_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
+				                                      GetGroup(state).ordinal);
+			}
+			auto rows_read = child_reader.ReadPlainDoubles(scan_count, define_ptr, repeat_ptr, outputs[i]);
+			if (rows_read != scan_count) {
+				throw InvalidInputException(
+				    "Mismatch in parquet direct double read for column %llu, expected %llu rows, got %llu",
+				    file_col_idx, scan_count, rows_read);
+			}
 		}
 	}
 
@@ -1537,6 +1571,7 @@ AsyncResult ParquetReader::ScanDirectDoublesToSink(ClientContext &context, Parqu
                                                    idx_t output_count, idx_t capacity, idx_t &rows_out,
                                                    ResizeableBuffer &scratch,
                                                    const ParquetDirectDoubleColumnSink &sink) {
+	DBSParquetMetricScope direct_scan_scope(duckdb_dbs_parquet_reader_metrics_add_direct_scan_ns);
 	rows_out = 0;
 	if (output_count != column_ids.size() || capacity == 0 || !sink) {
 		throw InvalidInputException("invalid direct double parquet scan sink");
@@ -1553,6 +1588,7 @@ AsyncResult ParquetReader::ScanDirectDoublesToSink(ClientContext &context, Parqu
 	}
 
 	while (state.current_group < 0 || (int64_t)state.offset_in_group >= GetGroup(state).num_rows) {
+		DBSParquetMetricScope row_group_scope(duckdb_dbs_parquet_reader_metrics_add_row_group_setup_ns);
 		state.current_group++;
 		state.offset_in_group = 0;
 
@@ -1639,23 +1675,33 @@ AsyncResult ParquetReader::ScanDirectDoublesToSink(ClientContext &context, Parqu
 	auto repeat_ptr = (uint8_t *)state.repeat_buf.ptr;
 	auto &root_reader = state.root_reader->Cast<StructColumnReader>();
 
-	scratch.resize(allocator, scan_count * sizeof(double));
+	{
+		DBSParquetMetricScope scratch_scope(duckdb_dbs_parquet_reader_metrics_add_scratch_resize_ns);
+		scratch.resize(allocator, scan_count * sizeof(double));
+	}
 	auto scratch_values = reinterpret_cast<double *>(scratch.ptr);
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		auto col_idx = MultiFileLocalIndex(i);
-		auto file_col_idx = column_ids[col_idx];
-		auto &child_reader = root_reader.GetChildReader(file_col_idx);
-		if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_V1) {
-			child_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
-			                                      GetGroup(state).ordinal);
+	{
+		DBSParquetMetricScope column_loop_scope(duckdb_dbs_parquet_reader_metrics_add_column_loop_ns);
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			auto col_idx = MultiFileLocalIndex(i);
+			auto file_col_idx = column_ids[col_idx];
+			auto &child_reader = root_reader.GetChildReader(file_col_idx);
+			if (metadata->crypto_metadata->encryption_algorithm.__isset.AES_GCM_V1) {
+				child_reader.InitializeCryptoMetadata(metadata->crypto_metadata->encryption_algorithm,
+				                                      GetGroup(state).ordinal);
+			}
+			auto rows_read = child_reader.ReadPlainDoubles(scan_count, define_ptr, repeat_ptr, scratch_values);
+			if (rows_read != scan_count) {
+				throw InvalidInputException(
+				    "Mismatch in parquet direct double sink read for column %llu, expected %llu rows, got %llu",
+				    file_col_idx, scan_count, rows_read);
+			}
+			{
+				DBSParquetMetricScope sink_scope(duckdb_dbs_parquet_reader_metrics_add_sink_ns);
+				sink(i, scratch_values, scan_count);
+			}
+			duckdb_dbs_parquet_reader_metrics_add_sink_calls(1);
 		}
-		auto rows_read = child_reader.ReadPlainDoubles(scan_count, define_ptr, repeat_ptr, scratch_values);
-		if (rows_read != scan_count) {
-			throw InvalidInputException(
-			    "Mismatch in parquet direct double sink read for column %llu, expected %llu rows, got %llu",
-			    file_col_idx, scan_count, rows_read);
-		}
-		sink(i, scratch_values, scan_count);
 	}
 
 	rows_read += scan_count;

@@ -50,6 +50,12 @@ struct DuckDBDBSParquetReaderMetricsSnapshot {
 	uint64_t decode_calls;
 	uint64_t prefetch_ranges;
 	uint64_t prefetch_bytes;
+	uint64_t direct_scan_ns;
+	uint64_t row_group_setup_ns;
+	uint64_t column_loop_ns;
+	uint64_t sink_ns;
+	uint64_t scratch_resize_ns;
+	uint64_t sink_calls;
 };
 
 namespace {
@@ -67,6 +73,12 @@ struct DBSParquetReaderMetricsState {
 	std::atomic<uint64_t> decode_calls {0};
 	std::atomic<uint64_t> prefetch_ranges {0};
 	std::atomic<uint64_t> prefetch_bytes {0};
+	std::atomic<uint64_t> direct_scan_ns {0};
+	std::atomic<uint64_t> row_group_setup_ns {0};
+	std::atomic<uint64_t> column_loop_ns {0};
+	std::atomic<uint64_t> sink_ns {0};
+	std::atomic<uint64_t> scratch_resize_ns {0};
+	std::atomic<uint64_t> sink_calls {0};
 };
 
 static DBSParquetReaderMetricsState dbs_parquet_reader_metrics;
@@ -125,6 +137,12 @@ extern "C" void duckdb_dbs_parquet_reader_metrics_reset() {
 	dbs_parquet_reader_metrics.decode_calls.store(0, std::memory_order_relaxed);
 	dbs_parquet_reader_metrics.prefetch_ranges.store(0, std::memory_order_relaxed);
 	dbs_parquet_reader_metrics.prefetch_bytes.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.direct_scan_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.row_group_setup_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.column_loop_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.sink_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.scratch_resize_ns.store(0, std::memory_order_relaxed);
+	dbs_parquet_reader_metrics.sink_calls.store(0, std::memory_order_relaxed);
 }
 
 extern "C" void duckdb_dbs_parquet_reader_metrics_snapshot(DuckDBDBSParquetReaderMetricsSnapshot *out) {
@@ -143,6 +161,36 @@ extern "C" void duckdb_dbs_parquet_reader_metrics_snapshot(DuckDBDBSParquetReade
 	out->decode_calls = dbs_parquet_reader_metrics.decode_calls.load(std::memory_order_relaxed);
 	out->prefetch_ranges = dbs_parquet_reader_metrics.prefetch_ranges.load(std::memory_order_relaxed);
 	out->prefetch_bytes = dbs_parquet_reader_metrics.prefetch_bytes.load(std::memory_order_relaxed);
+	out->direct_scan_ns = dbs_parquet_reader_metrics.direct_scan_ns.load(std::memory_order_relaxed);
+	out->row_group_setup_ns = dbs_parquet_reader_metrics.row_group_setup_ns.load(std::memory_order_relaxed);
+	out->column_loop_ns = dbs_parquet_reader_metrics.column_loop_ns.load(std::memory_order_relaxed);
+	out->sink_ns = dbs_parquet_reader_metrics.sink_ns.load(std::memory_order_relaxed);
+	out->scratch_resize_ns = dbs_parquet_reader_metrics.scratch_resize_ns.load(std::memory_order_relaxed);
+	out->sink_calls = dbs_parquet_reader_metrics.sink_calls.load(std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_direct_scan_ns(uint64_t ns) {
+	dbs_parquet_reader_metrics.direct_scan_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_row_group_setup_ns(uint64_t ns) {
+	dbs_parquet_reader_metrics.row_group_setup_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_column_loop_ns(uint64_t ns) {
+	dbs_parquet_reader_metrics.column_loop_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_ns(uint64_t ns) {
+	dbs_parquet_reader_metrics.sink_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_scratch_resize_ns(uint64_t ns) {
+	dbs_parquet_reader_metrics.scratch_resize_ns.fetch_add(ns, std::memory_order_relaxed);
+}
+
+extern "C" void duckdb_dbs_parquet_reader_metrics_add_sink_calls(uint64_t count) {
+	dbs_parquet_reader_metrics.sink_calls.fetch_add(count, std::memory_order_relaxed);
 }
 
 namespace duckdb {
