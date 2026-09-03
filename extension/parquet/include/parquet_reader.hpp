@@ -27,6 +27,7 @@
 #include "duckdb/execution/adaptive_filter.hpp"
 
 #include <exception>
+#include <functional>
 
 namespace duckdb_parquet {
 namespace format {
@@ -41,6 +42,8 @@ class BaseStatistics;
 class TableFilterSet;
 class ParquetEncryptionConfig;
 class ParquetReader;
+
+using ParquetDirectDoubleColumnSink = std::function<void(idx_t column_idx, const double *values, idx_t count)>;
 
 struct ParquetReaderPrefetchConfig {
 	// Percentage of data in a row group span that should be scanned for enabling whole group prefetch
@@ -184,6 +187,9 @@ public:
 	AsyncResult Scan(ClientContext &context, ParquetReaderScanState &state, DataChunk &output);
 	AsyncResult ScanDirectDoubles(ClientContext &context, ParquetReaderScanState &state, double **outputs,
 	                              idx_t output_count, idx_t capacity, idx_t &rows_out);
+	AsyncResult ScanDirectDoublesToSink(ClientContext &context, ParquetReaderScanState &state,
+	                                    idx_t output_count, idx_t capacity, idx_t &rows_out,
+	                                    ResizeableBuffer &scratch, const ParquetDirectDoubleColumnSink &sink);
 
 	idx_t NumRows() const;
 	idx_t NumRowGroups() const;
