@@ -955,7 +955,8 @@ void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, d
 	if (HasRepeats()) {
 		throw InvalidInputException("direct double parquet scan does not support repeated fields");
 	}
-	const auto all_valid = PrepareRead(read_now, define_out, repeat_out, result_offset);
+	D_ASSERT(read_now <= STANDARD_VECTOR_SIZE);
+	const auto all_valid = PrepareRead(read_now, define_out, repeat_out, 0);
 	if (!all_valid) {
 		throw InvalidInputException("direct double parquet scan requires all-valid payload values");
 	}
@@ -1031,7 +1032,6 @@ idx_t ColumnReader::ReadPlainDoubles(uint64_t num_values, data_ptr_t define_out,
 	BeginRead(define_out, repeat_out);
 	idx_t result_offset = 0;
 	auto to_read = num_values;
-	D_ASSERT(to_read <= STANDARD_VECTOR_SIZE);
 	while (to_read > 0) {
 		auto read_now = ReadPageHeaders(to_read);
 		ReadPlainDoublesData(read_now, define_out, repeat_out, result_out, result_offset);

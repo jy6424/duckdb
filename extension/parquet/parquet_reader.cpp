@@ -1411,7 +1411,7 @@ void ParquetReader::GetPartitionStats(const duckdb_parquet::FileMetaData &metada
 AsyncResult ParquetReader::ScanDirectDoubles(ClientContext &context, ParquetReaderScanState &state, double **outputs,
                                              idx_t output_count, idx_t capacity, idx_t &rows_out) {
 	rows_out = 0;
-	if (!outputs || output_count != column_ids.size() || capacity == 0 || capacity > STANDARD_VECTOR_SIZE) {
+	if (!outputs || output_count != column_ids.size() || capacity == 0) {
 		throw InvalidInputException("invalid direct double parquet scan output buffers");
 	}
 	if (filters) {
