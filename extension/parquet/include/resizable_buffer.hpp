@@ -101,6 +101,12 @@ public:
 			ptr = allocated_data.get();
 		}
 	}
+	void reference(data_ptr_t new_ptr, const uint64_t new_size) {
+		allocated_data.Reset();
+		alloc_len = 0;
+		ptr = new_ptr;
+		len = new_size;
+	}
 	void reset() {
 		ptr = allocated_data.get();
 		len = alloc_len;

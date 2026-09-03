@@ -25,6 +25,7 @@
 #include "duckdb/storage/caching_file_system.hpp"
 #include "duckdb/common/file_system.hpp"
 #include "duckdb/common/allocator.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 namespace duckdb {
 
@@ -409,6 +410,23 @@ public:
 
 		location += len;
 		return len;
+	}
+
+	void ReadPointer(data_ptr_t &buffer, uint32_t len, BufferHandle &pin) {
+		auto prefetch_buffer = ra_buffer.GetReadHead(location);
+		if (prefetch_buffer != nullptr && location - prefetch_buffer->location + len <= prefetch_buffer->size) {
+			D_ASSERT(location - prefetch_buffer->location + len <= prefetch_buffer->size);
+			ra_buffer.WaitForReadHead(*prefetch_buffer);
+			D_ASSERT(prefetch_buffer->buffer_handle.IsValid());
+			if (pin.IsValid()) {
+				pin.Destroy();
+			}
+			buffer = prefetch_buffer->buffer_ptr + location - prefetch_buffer->location;
+		} else {
+			pin = file_handle.Read(buffer, len, location);
+			D_ASSERT(pin.IsValid());
+		}
+		location += len;
 	}
 
 	// Prefetch a single buffer

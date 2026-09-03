@@ -484,6 +484,16 @@ void ColumnReader::ReadData(const data_ptr_t buffer, const uint32_t buffer_size,
 	dbs_parquet_reader_metrics.page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
 }
 
+void ColumnReader::ReadDataPointer(data_ptr_t &buffer, const uint32_t buffer_size, PageType::type page_type) {
+	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_payload_read_ns);
+	if (reader.parquet_options.encryption_config) {
+		throw InvalidInputException("direct Parquet page buffer does not support encrypted pages");
+	}
+	auto &trans = reinterpret_cast<ThriftFileTransport &>(*protocol->getTransport());
+	trans.ReadPointer(buffer, buffer_size, direct_block_handle);
+	dbs_parquet_reader_metrics.page_payload_bytes.fetch_add(buffer_size, std::memory_order_relaxed);
+}
+
 void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_ptr<TableFilterState> filter_state) {
 	encoding = ColumnEncoding::INVALID;
 	defined_decoder.reset();
@@ -549,6 +559,11 @@ void ColumnReader::PrepareRead(optional_ptr<const TableFilter> filter, optional_
 void ColumnReader::ResetPage() {
 }
 
+static bool DBSParquetDirectPageBufferEnabled() {
+	return DBSParquetEnvFlag("DUCKDB_PARQUET_DIRECT_PAGE_BUFFER") ||
+	       DBSParquetEnvFlag("DUCKDB_GPU_PARQUET_DIRECT_DOUBLE_SCAN");
+}
+
 void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	DBSParquetMetricTimer timer(dbs_parquet_reader_metrics.page_prepare_ns);
 	D_ASSERT(page_hdr.type == PageType::DATA_PAGE_V2);
@@ -561,6 +576,15 @@ void ColumnReader::PreparePageV2(PageHeader &page_hdr) {
 	if (chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		if (page_hdr.compressed_page_size != page_hdr.uncompressed_page_size) {
 			throw InvalidInputException("Failed to read file \"%s\": Page size mismatch", Reader().GetFileName());
+		}
+		if (DBSParquetDirectPageBufferEnabled()) {
+			data_ptr_t page_ptr = nullptr;
+			ReadDataPointer(page_ptr, page_hdr.compressed_page_size, page_hdr.type);
+			if (!block) {
+				block = make_shared_ptr<ResizeableBuffer>();
+			}
+			block->reference(page_ptr, page_hdr.uncompressed_page_size);
+			return;
 		}
 		uncompressed = true;
 	}
@@ -644,6 +668,15 @@ void ColumnReader::PreparePage(PageHeader &page_hdr) {
 	if (chunk->meta_data.codec == CompressionCodec::UNCOMPRESSED) {
 		if (compressed_page_size != NumericCast<uint32_t>(page_hdr.uncompressed_page_size)) {
 			throw std::runtime_error("Page size mismatch");
+		}
+		if (DBSParquetDirectPageBufferEnabled()) {
+			data_ptr_t page_ptr = nullptr;
+			ReadDataPointer(page_ptr, compressed_page_size, page_hdr.type);
+			if (!block) {
+				block = make_shared_ptr<ResizeableBuffer>();
+			}
+			block->reference(page_ptr, page_hdr.uncompressed_page_size);
+			return;
 		}
 		ReadData(block->ptr, compressed_page_size, page_hdr.type);
 		return;

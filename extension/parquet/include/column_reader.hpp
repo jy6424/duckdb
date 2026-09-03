@@ -28,6 +28,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "duckdb/common/types/vector_cache.hpp"
 #include "duckdb/common/encryption_functions.hpp"
+#include "duckdb/storage/buffer/buffer_handle.hpp"
 
 namespace duckdb {
 class ParquetReader;
@@ -198,6 +199,7 @@ protected:
 	void ReadDataEncrypted(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type module);
 	void Read(PageHeader &page_hdr);
 	void ReadData(const data_ptr_t buffer, const uint32_t buffer_size, PageType::type page_type);
+	void ReadDataPointer(data_ptr_t &buffer, const uint32_t buffer_size, PageType::type page_type);
 
 private:
 	//! Check if a previous table filter has filtered out this page
@@ -328,6 +330,7 @@ private:
 	idx_t chunk_read_offset;
 
 	shared_ptr<ResizeableBuffer> block;
+	BufferHandle direct_block_handle;
 
 	ColumnEncoding encoding = ColumnEncoding::INVALID;
 	unique_ptr<RleBpDecoder> defined_decoder;
