@@ -926,31 +926,36 @@ void ColumnReader::ReadPlainDoublesData(idx_t read_now, data_ptr_t define_out, d
 	if (!all_valid) {
 		throw InvalidInputException("direct double parquet scan requires all-valid payload values");
 	}
-	if (encoding != ColumnEncoding::PLAIN) {
-		throw InvalidInputException("direct double parquet scan only supports plain encoded pages");
-	}
-
 	auto result_ptr = result + result_offset;
-	switch (Type().id()) {
-	case LogicalTypeId::DOUBLE: {
-		const auto copy_count = read_now * sizeof(double);
-		if (!block->check_available(copy_count)) {
-			throw InvalidInputException("direct double parquet scan read past available page bytes");
-		}
-		memcpy(result_ptr, block->ptr, copy_count);
-		block->unsafe_inc(copy_count);
+	switch (encoding) {
+	case ColumnEncoding::DICTIONARY:
+		dictionary_decoder.ReadDoubles(nullptr, read_now, result, result_offset);
 		break;
-	}
-	case LogicalTypeId::FLOAT:
-		if (!block->check_available(read_now * sizeof(float))) {
-			throw InvalidInputException("direct double parquet scan read past available page bytes");
+	case ColumnEncoding::PLAIN:
+		switch (Type().id()) {
+		case LogicalTypeId::DOUBLE: {
+			const auto copy_count = read_now * sizeof(double);
+			if (!block->check_available(copy_count)) {
+				throw InvalidInputException("direct double parquet scan read past available page bytes");
+			}
+			memcpy(result_ptr, block->ptr, copy_count);
+			block->unsafe_inc(copy_count);
+			break;
 		}
-		for (idx_t row_idx = 0; row_idx < read_now; row_idx++) {
-			result_ptr[row_idx] = static_cast<double>(block->unsafe_read<float>());
+		case LogicalTypeId::FLOAT:
+			if (!block->check_available(read_now * sizeof(float))) {
+				throw InvalidInputException("direct double parquet scan read past available page bytes");
+			}
+			for (idx_t row_idx = 0; row_idx < read_now; row_idx++) {
+				result_ptr[row_idx] = static_cast<double>(block->unsafe_read<float>());
+			}
+			break;
+		default:
+			throw InvalidInputException("direct double parquet scan only supports FLOAT and DOUBLE columns");
 		}
 		break;
 	default:
-		throw InvalidInputException("direct double parquet scan only supports FLOAT and DOUBLE columns");
+		throw InvalidInputException("direct double parquet scan only supports plain and dictionary encoded pages");
 	}
 
 	page_rows_available -= read_now;

@@ -135,6 +135,49 @@ idx_t DictionaryDecoder::Read(uint8_t *defines, idx_t read_count, Vector &result
 	return valid_count;
 }
 
+idx_t DictionaryDecoder::ReadDoubles(uint8_t *defines, idx_t read_count, double *result, idx_t result_offset) {
+	if (!dictionary) {
+		throw std::runtime_error("Parquet file is likely corrupted, missing dictionary");
+	}
+	auto valid_count = GetValidValues(defines, read_count, result_offset);
+	if (valid_count != read_count) {
+		throw InvalidInputException("direct double parquet dictionary scan requires all-valid payload values");
+	}
+
+	offset_buffer.resize(reader.reader.allocator, sizeof(uint32_t) * read_count);
+	auto offsets = reinterpret_cast<uint32_t *>(offset_buffer.ptr);
+	dict_decoder->GetBatch<uint32_t>(offset_buffer.ptr, NumericCast<uint32_t>(read_count));
+
+	uint32_t max_index = 0;
+	for (idx_t idx = 0; idx < read_count; idx++) {
+		max_index = MaxValue(max_index, offsets[idx]);
+	}
+	if (max_index >= dictionary_size) {
+		throw std::runtime_error("Parquet file is likely corrupted, dictionary offset out of range");
+	}
+
+	auto result_ptr = result + result_offset;
+	switch (reader.Type().id()) {
+	case LogicalTypeId::DOUBLE: {
+		auto dict_data = FlatVector::GetData<double>(dictionary->data);
+		for (idx_t idx = 0; idx < read_count; idx++) {
+			result_ptr[idx] = dict_data[offsets[idx]];
+		}
+		break;
+	}
+	case LogicalTypeId::FLOAT: {
+		auto dict_data = FlatVector::GetData<float>(dictionary->data);
+		for (idx_t idx = 0; idx < read_count; idx++) {
+			result_ptr[idx] = static_cast<double>(dict_data[offsets[idx]]);
+		}
+		break;
+	}
+	default:
+		throw InvalidInputException("direct double parquet dictionary scan only supports FLOAT and DOUBLE columns");
+	}
+	return valid_count;
+}
+
 void DictionaryDecoder::Skip(uint8_t *defines, idx_t skip_count) {
 	if (!dictionary) {
 		throw std::runtime_error("Parquet file is likely corrupted, missing dictionary");
